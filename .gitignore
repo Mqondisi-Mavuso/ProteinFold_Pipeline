@@ -1,0 +1,3 @@
+# Folders to be excluded 
+downloaded_sequences/
+__pycache__/

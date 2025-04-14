@@ -1,6 +1,7 @@
 from Bio import Entrez, SeqIO
 import re
 import os
+import sys
 
 class NCBISequenceFetcher:
     """Class for handling NCBI sequence searches and downloads"""
@@ -61,6 +62,8 @@ class NCBISequenceFetcher:
             Path to the saved file or None if error
         """
         try:
+            print(f"Downloading sequence ID: {seq_id}, length: {seq_length}")
+            
             # Create parameters for fetch
             params = {
                 "db": "nucleotide",
@@ -74,10 +77,16 @@ class NCBISequenceFetcher:
                 params["seq_start"] = 1
                 params["seq_stop"] = seq_length
             
-            # Fetch the sequence using the proven direct approach
+            print(f"Using Entrez.efetch with params: {params}")
+            
+            # Fetch the sequence
             handle = Entrez.efetch(**params)
             sequence_data = handle.read()
             handle.close()
+            
+            # Debug: Check what we received
+            print(f"Received data length: {len(sequence_data)} bytes")
+            print(f"First 100 characters: {sequence_data[:100]}")
             
             if not sequence_data:
                 print("No sequence data received")
@@ -87,26 +96,45 @@ class NCBISequenceFetcher:
             first_line = sequence_data.split('\n')[0]
             accession_match = re.search(r'>(\S+)', first_line)
             if accession_match:
-                accession = accession_match.group(1)
+                raw_accession = accession_match.group(1)
+                # Clean the accession for safe file naming
+                accession = re.sub(r'[\\/*?:"<>|]', '_', raw_accession)
+                print(f"Extracted accession: {raw_accession}")
+                print(f"Cleaned for filename: {accession}")
             else:
                 accession = f"sequence_{seq_id}"
+                print(f"Could not extract accession, using: {accession}")
             
-            # Save to file
-            filename = f"{accession}_seq.fasta"
+            # Create a Windows-safe filename
+            if seq_length > 0:
+                filename = f"{accession}_{seq_length}bp.fasta"
+            else:
+                filename = f"{accession}_full.fasta"
+                
             filepath = os.path.join(output_dir, filename)
+            print(f"Saving to: {filepath}")
             
-            with open(filepath, "w", encoding="utf-8") as outfile:
-                outfile.write(sequence_data)
+            # Make sure the directory exists
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Write the file with explicit binary mode
+            with open(filepath, "wb") as outfile:
+                outfile.write(sequence_data.encode('utf-8'))
             
             # Verify file was written correctly
             if os.path.getsize(filepath) == 0:
                 print("Failed to write sequence data to file (file is empty)")
                 return None
+            else:
+                filesize = os.path.getsize(filepath)
+                print(f"File written successfully: {filesize} bytes")
                 
             return filepath
             
         except Exception as e:
             print(f"Error downloading sequence: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return None
             
     def find_mane_select(self, organism, gene_name):

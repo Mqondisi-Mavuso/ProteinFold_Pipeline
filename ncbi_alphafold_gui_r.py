@@ -1,9 +1,10 @@
 import sys
+import os
+import traceback
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QRadioButton, QGroupBox, 
                              QTextEdit, QSpinBox, QMessageBox, QProgressBar, QButtonGroup)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-import os
 from ncbi_sequence_fetcher import NCBISequenceFetcher
 
 class NCBISearchThread(QThread):
@@ -30,13 +31,14 @@ class NCBISearchThread(QThread):
             self.result_signal.emit(results)
             
         except Exception as e:
-            self.error_signal.emit(f"Error: {str(e)}")
+            self.error_signal.emit(f"Error: {str(e)}\n{traceback.format_exc()}")
 
 
 class SequenceDownloadThread(QThread):
     """Thread for downloading sequences without blocking the GUI"""
     finished_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(str)  # New signal for progress updates
     
     def __init__(self, seq_id, seq_length, email, output_dir="."):
         super().__init__()
@@ -47,18 +49,39 @@ class SequenceDownloadThread(QThread):
         
     def run(self):
         try:
+            # Send progress update
+            self.progress_signal.emit(f"Starting download of sequence ID: {self.seq_id}")
+            
             # Create fetcher and download
             fetcher = NCBISequenceFetcher(self.email)
+            
+            # Make sure the output directory exists
+            os.makedirs(self.output_dir, exist_ok=True)
+            
+            # Progress update
+            self.progress_signal.emit("Sending request to NCBI...")
+            
+            # Download the sequence
             filepath = fetcher.download_sequence(self.seq_id, self.seq_length, self.output_dir)
             
             if not filepath:
                 self.error_signal.emit("Failed to download sequence. Check console for details.")
                 return
+            
+            # Verify the file exists and has content
+            if not os.path.exists(filepath):
+                self.error_signal.emit(f"File was not created at: {filepath}")
+                return
                 
+            filesize = os.path.getsize(filepath)
+            if filesize == 0:
+                self.error_signal.emit(f"File was created but is empty: {filepath}")
+                return
+                
+            self.progress_signal.emit(f"Successfully downloaded {filesize} bytes to {filepath}")
             self.finished_signal.emit(filepath)
             
         except Exception as e:
-            import traceback
             traceback_str = traceback.format_exc()
             self.error_signal.emit(f"Error: {str(e)}\n{traceback_str}")
 
@@ -281,40 +304,76 @@ class MainWindow(QMainWindow):
         email = self.email_input.text().strip()
         seq_length = self.length_input.value()
         
+        # Create output directory in the current working directory if it doesn't exist
+        output_dir = "downloaded_sequences"
+        os.makedirs(output_dir, exist_ok=True)
+        
         # Update status
         self.status_label.setText("Downloading sequence...")
         self.progress_bar.setVisible(True)
+        self.download_button.setEnabled(False)  # Disable button during download
         
         # Create and start the download thread
-        self.download_thread = SequenceDownloadThread(self.selected_result_id, seq_length, email)
+        self.download_thread = SequenceDownloadThread(self.selected_result_id, seq_length, email, output_dir)
         self.download_thread.finished_signal.connect(self.handle_download_finished)
         self.download_thread.error_signal.connect(self.handle_error)
+        
+        # Connect to the new progress signal
+        self.download_thread.progress_signal.connect(self.update_status)
+        
         self.download_thread.start()
-    
+
+    def update_status(self, message):
+        """Update the status label with progress messages"""
+        self.status_label.setText(message)
+        # Also log to the results display for a record
+        self.results_display.append(f"[Status] {message}")
+
     def handle_download_finished(self, filepath):
         """Handle completion of the download"""
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"Sequence downloaded to {filepath}")
+        self.download_button.setEnabled(True)  # Re-enable the button
+        
+        # Read a bit of the file to confirm content
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                file_preview = f.read(200)  # Read first 200 chars
+            
+            # Show success message with file preview
+            QMessageBox.information(self, "Download Complete", 
+                                f"The sequence has been downloaded successfully to:\n{filepath}\n\n"
+                                f"Preview of file content:\n{file_preview}")
+        except Exception as e:
+            QMessageBox.warning(self, "Download Issue", 
+                            f"File was created but there may be issues with it: {str(e)}")
         
         # Enable AlphaFold button
         self.alphafold_button.setEnabled(True)
+    
+    def handle_error(self, error_message):
+        """Handle errors from worker threads"""
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Error occurred")
+        self.download_button.setEnabled(True)  # Re-enable the button
         
-        # Show success message
-        QMessageBox.information(self, "Download Complete", 
-                              f"The sequence has been downloaded successfully to:\n{filepath}")
+        # Show error dialog with details
+        error_dialog = QMessageBox()
+        error_dialog.setIcon(QMessageBox.Icon.Critical)
+        error_dialog.setText("An error occurred during the operation")
+        error_dialog.setInformativeText(error_message)
+        error_dialog.setWindowTitle("Error")
+        error_dialog.setDetailedText(error_message)
+        error_dialog.exec()
+        
+        # Also log the error to the results display
+        self.results_display.append(f"[ERROR] {error_message}")
     
     def submit_to_alphafold(self):
         """Submit the sequence to AlphaFold (placeholder for now)"""
         QMessageBox.information(self, "AlphaFold Submission", 
                               "This feature will allow submission to AlphaFold 3.\n"
                               "Currently it's a placeholder for the next development phase.")
-    
-    def handle_error(self, error_message):
-        """Handle errors from worker threads"""
-        self.progress_bar.setVisible(False)
-        self.status_label.setText("Error occurred")
-        
-        QMessageBox.warning(self, "Error", error_message)
 
 
 def download_gene_sequence(organism, gene_name, email, seq_length=2100):
