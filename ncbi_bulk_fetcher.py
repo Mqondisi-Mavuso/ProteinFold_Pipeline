@@ -185,7 +185,8 @@ class NCBIBulkFetcher:
                         filepath = self.fetcher.download_sequence(
                             best_result['id'], 
                             seq_length, 
-                            output_dir
+                            output_dir,
+                            gene_name
                         )
                         
                         if filepath:
