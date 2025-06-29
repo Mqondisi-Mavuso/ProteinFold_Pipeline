@@ -4,11 +4,13 @@ import traceback
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QRadioButton, QGroupBox, 
                              QTextEdit, QSpinBox, QMessageBox, QProgressBar, QButtonGroup,
-                             QSplitter, QFileDialog, QTabWidget, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+                             QSplitter, QFileDialog, QTabWidget, QCheckBox, QComboBox,
+                             QTableWidget, QTableWidgetItem, QHeaderView)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
 from ncbi_threads import NCBISearchThread, SequenceDownloadThread
+from ncbi_bulk_threads import BulkDownloadThread, ExcelLoadThread, RetryFailedThread
 from preprocess_dna import SequenceProcessor
 from alphafold_crawler_2 import AlphaFoldSubmitter
 
@@ -16,7 +18,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NCBI Sequence Retriever & AlphaFold Submitter")
-        self.setMinimumSize(1200, 700)
+        self.setMinimumSize(1400, 800)
         
         # Store search results
         self.search_results = []
@@ -24,6 +26,12 @@ class MainWindow(QMainWindow):
         self.current_fasta_path = None
         self.roi_sequence = None
         self.protein_sequence_text = None
+        
+        # Bulk download variables
+        self.current_gene_list = []
+        self.bulk_download_thread = None
+        self.excel_load_thread = None
+        self.retry_thread = None
         
         # Create the AlphaFold submitter
         self.alphafold_submitter = AlphaFoldSubmitter()
@@ -40,7 +48,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
         
-        # Left side - NCBI Sequence Retriever
+        # Left side - NCBI Sequence Retriever (with tabs for single and bulk)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         
@@ -48,6 +56,33 @@ class MainWindow(QMainWindow):
         ncbi_title = QLabel("NCBI Sequence Retriever")
         ncbi_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         left_layout.addWidget(ncbi_title)
+        
+        # Create tabs for single and bulk download
+        ncbi_tabs = QTabWidget()
+        left_layout.addWidget(ncbi_tabs)
+        
+        # Tab 1: Single Sequence Download
+        single_tab = self.create_single_download_tab()
+        ncbi_tabs.addTab(single_tab, "Single Download")
+        
+        # Tab 2: Bulk Sequence Download
+        bulk_tab = self.create_bulk_download_tab()
+        ncbi_tabs.addTab(bulk_tab, "Bulk Download")
+        
+        # Right side - AlphaFold Predictor (unchanged)
+        right_widget = self.create_alphafold_tab()
+        
+        # Add widgets to splitter
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        
+        # Set initial sizes (60/40 split to accommodate bulk download table)
+        splitter.setSizes([840, 560])
+    
+    def create_single_download_tab(self):
+        """Create the single sequence download tab"""
+        single_widget = QWidget()
+        single_layout = QVBoxLayout(single_widget)
         
         # Input section
         input_group = QGroupBox("Search Parameters")
@@ -97,7 +132,7 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.search_button)
         
         input_group.setLayout(input_layout)
-        left_layout.addWidget(input_group)
+        single_layout.addWidget(input_group)
         
         # Results display
         results_group = QGroupBox("Results")
@@ -116,7 +151,7 @@ class MainWindow(QMainWindow):
         results_layout.addWidget(self.selection_group)
         
         results_group.setLayout(results_layout)
-        left_layout.addWidget(results_group)
+        single_layout.addWidget(results_group)
         
         # Action buttons
         action_layout = QHBoxLayout()
@@ -131,7 +166,7 @@ class MainWindow(QMainWindow):
         self.send_to_alphafold_button.setEnabled(False)
         action_layout.addWidget(self.send_to_alphafold_button)
         
-        left_layout.addLayout(action_layout)
+        single_layout.addLayout(action_layout)
         
         # Status bar and progress
         status_layout = QHBoxLayout()
@@ -142,9 +177,381 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.status_label)
         status_layout.addWidget(self.progress_bar)
         
-        left_layout.addLayout(status_layout)
+        single_layout.addLayout(status_layout)
         
-        # Right side - AlphaFold Predictor
+        return single_widget
+    
+    def create_bulk_download_tab(self):
+        """Create the bulk sequence download tab"""
+        bulk_widget = QWidget()
+        bulk_layout = QVBoxLayout(bulk_widget)
+        
+        # File loading section
+        file_group = QGroupBox("Load Gene List from Excel")
+        file_layout = QVBoxLayout()
+        
+        # File selection
+        file_select_layout = QHBoxLayout()
+        self.excel_path_label = QLabel("No file selected")
+        self.browse_excel_button = QPushButton("Browse Excel File")
+        self.browse_excel_button.clicked.connect(self.browse_excel_file)
+        file_select_layout.addWidget(QLabel("Excel File:"))
+        file_select_layout.addWidget(self.excel_path_label)
+        file_select_layout.addWidget(self.browse_excel_button)
+        file_layout.addLayout(file_select_layout)
+        
+        # Column configuration
+        col_config_layout = QHBoxLayout()
+        
+        # Gene column
+        col_config_layout.addWidget(QLabel("Gene Column:"))
+        self.gene_column_combo = QComboBox()
+        self.gene_column_combo.addItems(["Column A (0)", "Column B (1)", "Column C (2)", "Column D (3)"])
+        col_config_layout.addWidget(self.gene_column_combo)
+        
+        # Organism column (optional)
+        col_config_layout.addWidget(QLabel("Organism Column:"))
+        self.organism_column_combo = QComboBox()
+        self.organism_column_combo.addItems(["None", "Column A (0)", "Column B (1)", "Column C (2)", "Column D (3)"])
+        col_config_layout.addWidget(self.organism_column_combo)
+        
+        # Status column (optional)
+        col_config_layout.addWidget(QLabel("Status Column:"))
+        self.status_column_combo = QComboBox()
+        self.status_column_combo.addItems(["None", "Column A (0)", "Column B (1)", "Column C (2)", "Column D (3)"])
+        self.status_column_combo.setCurrentText("Column B (1)")
+        col_config_layout.addWidget(self.status_column_combo)
+        
+        file_layout.addLayout(col_config_layout)
+        
+        # Load button
+        self.load_excel_button = QPushButton("Load Gene List")
+        self.load_excel_button.clicked.connect(self.load_excel_file)
+        self.load_excel_button.setEnabled(False)
+        file_layout.addWidget(self.load_excel_button)
+        
+        file_group.setLayout(file_layout)
+        bulk_layout.addWidget(file_group)
+        
+        # Gene list display
+        list_group = QGroupBox("Gene List")
+        list_layout = QVBoxLayout()
+        
+        # Info labels
+        info_layout = QHBoxLayout()
+        self.gene_count_label = QLabel("Genes loaded: 0")
+        self.organism_info_label = QLabel("Default organism: homo sapiens")
+        info_layout.addWidget(self.gene_count_label)
+        info_layout.addWidget(self.organism_info_label)
+        info_layout.addStretch()
+        list_layout.addLayout(info_layout)
+        
+        # Gene table
+        self.gene_table = QTableWidget()
+        self.gene_table.setColumnCount(4)
+        self.gene_table.setHorizontalHeaderLabels(["Gene Name", "Organism", "Status", "Row"])
+        self.gene_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.gene_table.setMaximumHeight(200)
+        list_layout.addWidget(self.gene_table)
+        
+        list_group.setLayout(list_layout)
+        bulk_layout.addWidget(list_group)
+        
+        # Bulk download settings
+        settings_group = QGroupBox("Bulk Download Settings")
+        settings_layout = QVBoxLayout()
+        
+        # Settings row 1
+        settings_row1 = QHBoxLayout()
+        
+        # Email
+        settings_row1.addWidget(QLabel("Email:"))
+        self.bulk_email_input = QLineEdit()
+        settings_row1.addWidget(self.bulk_email_input)
+
+        # IMPORTANT FIX: Connect email input to update button state
+        self.bulk_email_input.textChanged.connect(self.update_bulk_download_button_state)
+        
+        # Sequence length
+        settings_row1.addWidget(QLabel("Sequence Length:"))
+        self.bulk_length_input = QSpinBox()
+        self.bulk_length_input.setRange(0, 1000000)
+        self.bulk_length_input.setValue(2100)
+        self.bulk_length_input.setSpecialValueText("Full Length")
+        settings_row1.addWidget(self.bulk_length_input)
+        
+        settings_layout.addLayout(settings_row1)
+        
+        # Settings row 2
+        settings_row2 = QHBoxLayout()
+        
+        # Output directory
+        settings_row2.addWidget(QLabel("Output Directory:"))
+        self.output_dir_label = QLabel("bulk_sequences")
+        self.browse_output_button = QPushButton("Browse")
+        self.browse_output_button.clicked.connect(self.browse_output_directory)
+        settings_row2.addWidget(self.output_dir_label)
+        settings_row2.addWidget(self.browse_output_button)
+        
+        # Delay between requests
+        settings_row2.addWidget(QLabel("Delay (sec):"))
+        self.delay_input = QSpinBox()
+        self.delay_input.setRange(1, 60)
+        self.delay_input.setValue(2)
+        settings_row2.addWidget(self.delay_input)
+        
+        settings_layout.addLayout(settings_row2)
+        
+        settings_group.setLayout(settings_layout)
+        bulk_layout.addWidget(settings_group)
+        
+        # Control buttons
+        control_layout = QHBoxLayout()
+        
+        self.start_bulk_button = QPushButton("Start Bulk Download")
+        self.start_bulk_button.clicked.connect(self.start_bulk_download)
+        self.start_bulk_button.setEnabled(False)
+        control_layout.addWidget(self.start_bulk_button)
+        
+        self.stop_bulk_button = QPushButton("Stop Download")
+        self.stop_bulk_button.clicked.connect(self.stop_bulk_download)
+        self.stop_bulk_button.setEnabled(False)
+        control_layout.addWidget(self.stop_bulk_button)
+        
+        self.retry_failed_button = QPushButton("Retry Failed")
+        self.retry_failed_button.clicked.connect(self.retry_failed_downloads)
+        self.retry_failed_button.setEnabled(False)
+        control_layout.addWidget(self.retry_failed_button)
+        
+        bulk_layout.addLayout(control_layout)
+        
+        # Progress section
+        progress_group = QGroupBox("Download Progress")
+        progress_layout = QVBoxLayout()
+        
+        # Progress bar
+        self.bulk_progress_bar = QProgressBar()
+        progress_layout.addWidget(self.bulk_progress_bar)
+        
+        # Status labels
+        status_info_layout = QHBoxLayout()
+        self.bulk_status_label = QLabel("Ready for bulk download")
+        self.bulk_stats_label = QLabel("Downloaded: 0 | Failed: 0")
+        status_info_layout.addWidget(self.bulk_status_label)
+        status_info_layout.addWidget(self.bulk_stats_label)
+        progress_layout.addLayout(status_info_layout)
+        
+        # Log area
+        self.bulk_log = QTextEdit()
+        self.bulk_log.setReadOnly(True)
+        self.bulk_log.setMaximumHeight(150)
+        progress_layout.addWidget(self.bulk_log)
+        
+        progress_group.setLayout(progress_layout)
+        bulk_layout.addWidget(progress_group)
+        
+        return bulk_widget
+    
+    def update_bulk_download_button_state(self):
+        """Update the state of the bulk download button"""
+        has_genes = len(self.current_gene_list) > 0
+        has_email = self.bulk_email_input.text().strip() != "" and '@' in self.bulk_email_input.text().strip()
+    
+        # Enable button only if we have both genes and a valid email
+        self.start_bulk_button.setEnabled(has_genes and has_email)
+    
+        # Debug print to help troubleshoot
+        print(f"Button state update: has_genes={has_genes}, has_email={has_email}, button_enabled={has_genes and has_email}")
+
+    # Single NCBI search remains unchanged
+    def search_ncbi(self):
+        """Perform a search on NCBI"""
+        # Get input values
+        gene = self.gene_input.text().strip()
+        organism = self.org_input.text().strip()
+        email = self.email_input.text().strip()
+        
+        # Basic validation
+        if not gene:
+            QMessageBox.warning(self, "Input Error", "Please enter a gene or protein name.")
+            return
+        
+        if not email or '@' not in email:
+            QMessageBox.warning(self, "Input Error", "Please enter a valid email address.")
+            return
+        
+        # Clear previous results
+        self.results_display.clear()
+        self.clear_selection_widgets()
+        self.search_results = []
+        self.selected_result_id = None
+        self.download_button.setEnabled(False)
+        self.send_to_alphafold_button.setEnabled(False)
+        
+        # Update status
+        self.status_label.setText(f"Searching for '{gene}' in '{organism}'...")
+        self.progress_bar.setVisible(True)
+        
+        # Create and start the search thread
+        self.search_thread = NCBISearchThread(gene, organism, email)
+        self.search_thread.result_signal.connect(self.display_search_results)
+        self.search_thread.error_signal.connect(self.handle_error)
+        self.search_thread.start()
+
+    def display_search_results(self, results):
+        """Display search results and create selection widgets"""
+        self.search_results = results
+        
+        # Display the results in the text area
+        self.results_display.append(f"Found {len(results)} sequences:")
+        for i, result in enumerate(results, 1):
+            mane_tag = " (MANE Select)" if result["is_mane"] else ""
+            refseq_tag = " (RefSeq)" if result["is_refseq"] and not result["is_mane"] else ""
+            self.results_display.append(f"{i}. {result['accession']}{mane_tag}{refseq_tag}")
+            self.results_display.append(f"   {result['title']}")
+            self.results_display.append(f"   Length: {result['length']} bp")
+            self.results_display.append("")
+        
+        # Create radio buttons for selection
+        self.clear_selection_widgets()
+        self.selection_group.setVisible(True)
+        
+        self.radio_group = QButtonGroup(self)
+        
+        for i, result in enumerate(results):
+            radio = QRadioButton(f"{result['accession']} - {result['title'][:50]}...")
+            
+            # Add tags for special types
+            if result["is_mane"]:
+                radio.setText(radio.text() + " (MANE Select)")
+                radio.setChecked(True)  # Auto-select MANE Select
+                self.selected_result_id = result["id"]
+            elif result["is_refseq"]:
+                radio.setText(radio.text() + " (RefSeq)")
+            
+            radio.setProperty("result_id", result["id"])
+            radio.toggled.connect(self.on_selection_changed)
+            self.selection_layout.addWidget(radio)
+            self.radio_group.addButton(radio)
+        
+        # If no MANE Select or RefSeq selected, select the first one
+        if self.selected_result_id is None and results:
+            first_radio = self.radio_group.buttons()[0]
+            first_radio.setChecked(True)
+            self.selected_result_id = results[0]["id"]
+        
+        # Update status
+        self.status_label.setText(f"Found {len(results)} sequences. Select one to download.")
+        self.progress_bar.setVisible(False)
+        self.download_button.setEnabled(True)
+    
+    def on_selection_changed(self):
+        """Handle selection of a sequence"""
+        sender = self.sender()
+        if sender.isChecked():
+            self.selected_result_id = sender.property("result_id")
+            self.download_button.setEnabled(True)
+    
+    def clear_selection_widgets(self):
+        """Clear the selection radio buttons"""
+        # Remove all widgets from selection layout
+        while self.selection_layout.count():
+            item = self.selection_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+    
+    def download_sequence(self):
+        """Download the selected sequence"""
+        if not self.selected_result_id:
+            QMessageBox.warning(self, "Selection Error", "Please select a sequence to download.")
+            return
+        
+        email = self.email_input.text().strip()
+        seq_length = self.length_input.value()
+        
+        # Create output directory in the current working directory if it doesn't exist
+        output_dir = "downloaded_sequences"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Update status
+        self.status_label.setText("Downloading sequence...")
+        self.progress_bar.setVisible(True)
+        self.download_button.setEnabled(False)  # Disable button during download
+        
+        # Create and start the download thread
+        self.download_thread = SequenceDownloadThread(self.selected_result_id, seq_length, email, output_dir)
+        self.download_thread.finished_signal.connect(self.handle_download_finished)
+        self.download_thread.error_signal.connect(self.handle_error)
+        
+        # Connect to the new progress signal
+        self.download_thread.progress_signal.connect(self.update_status)
+        
+        self.download_thread.start()
+    
+    def update_status(self, message):
+        """Update the status label with progress messages"""
+        self.status_label.setText(message)
+        # Also log to the results display for a record
+        self.results_display.append(f"[Status] {message}")
+
+    def handle_download_finished(self, filepath):
+        """Handle completion of the download"""
+        self.progress_bar.setVisible(False)
+        self.status_label.setText(f"Sequence downloaded to {filepath}")
+        self.download_button.setEnabled(True)  # Re-enable the button
+        self.send_to_alphafold_button.setEnabled(True)  # Enable send to AlphaFold button
+        
+        # Store the filepath for later use
+        self.current_fasta_path = filepath
+        
+        # Read a bit of the file to confirm content
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                file_preview = f.read(200)  # Read first 200 chars
+            
+            # Show success message with file preview
+            QMessageBox.information(self, "Download Complete", 
+                                  f"The sequence has been downloaded successfully to:\n{filepath}\n\n"
+                                  f"Preview of file content:\n{file_preview}")
+        except Exception as e:
+            QMessageBox.warning(self, "Download Issue", 
+                              f"File was created but there may be issues with it: {str(e)}")
+    
+    def handle_error(self, error_message):
+        """Handle errors from worker threads"""
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Error occurred")
+        self.download_button.setEnabled(True)  # Re-enable the button
+        
+        # Show error dialog with details
+        error_dialog = QMessageBox()
+        error_dialog.setIcon(QMessageBox.Icon.Critical)
+        error_dialog.setText("An error occurred during the operation")
+        error_dialog.setInformativeText(error_message)
+        error_dialog.setWindowTitle("Error")
+        error_dialog.setDetailedText(error_message)
+        error_dialog.exec()
+        
+        # Also log the error to the results display
+        self.results_display.append(f"[ERROR] {error_message}")
+    
+    def send_to_alphafold(self):
+        """Send the downloaded sequence to the AlphaFold tab"""
+        if not self.current_fasta_path:
+            QMessageBox.warning(self, "Error", "No sequence has been downloaded yet.")
+            return
+        
+        # Update the file path label
+        self.file_path_label.setText(self.current_fasta_path)
+        
+        # Enable the find ROI button
+        self.find_roi_button.setEnabled(True)
+        
+        # Optionally automatically find the ROI
+        self.find_roi()
+    
+    def create_alphafold_tab(self):
+        """Create the AlphaFold tab (unchanged from original)"""
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         
@@ -329,199 +736,8 @@ class MainWindow(QMainWindow):
         # Add the results tab
         tab_widget.addTab(results_tab, "Results")
         
-        # Add widgets to splitter
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        
-        # Set initial sizes (50/50 split)
-        splitter.setSizes([600, 600])
-    
-    def search_ncbi(self):
-        """Perform a search on NCBI"""
-        # Get input values
-        gene = self.gene_input.text().strip()
-        organism = self.org_input.text().strip()
-        email = self.email_input.text().strip()
-        
-        # Basic validation
-        if not gene:
-            QMessageBox.warning(self, "Input Error", "Please enter a gene or protein name.")
-            return
-        
-        if not email or '@' not in email:
-            QMessageBox.warning(self, "Input Error", "Please enter a valid email address.")
-            return
-        
-        # Clear previous results
-        self.results_display.clear()
-        self.clear_selection_widgets()
-        self.search_results = []
-        self.selected_result_id = None
-        self.download_button.setEnabled(False)
-        self.send_to_alphafold_button.setEnabled(False)
-        
-        # Update status
-        self.status_label.setText(f"Searching for '{gene}' in '{organism}'...")
-        self.progress_bar.setVisible(True)
-        
-        # Create and start the search thread
-        self.search_thread = NCBISearchThread(gene, organism, email)
-        self.search_thread.result_signal.connect(self.display_search_results)
-        self.search_thread.error_signal.connect(self.handle_error)
-        self.search_thread.start()
-    
-    def display_search_results(self, results):
-        """Display search results and create selection widgets"""
-        self.search_results = results
-        
-        # Display the results in the text area
-        self.results_display.append(f"Found {len(results)} sequences:")
-        for i, result in enumerate(results, 1):
-            mane_tag = " (MANE Select)" if result["is_mane"] else ""
-            refseq_tag = " (RefSeq)" if result["is_refseq"] and not result["is_mane"] else ""
-            self.results_display.append(f"{i}. {result['accession']}{mane_tag}{refseq_tag}")
-            self.results_display.append(f"   {result['title']}")
-            self.results_display.append(f"   Length: {result['length']} bp")
-            self.results_display.append("")
-        
-        # Create radio buttons for selection
-        self.clear_selection_widgets()
-        self.selection_group.setVisible(True)
-        
-        self.radio_group = QButtonGroup(self)
-        
-        for i, result in enumerate(results):
-            radio = QRadioButton(f"{result['accession']} - {result['title'][:50]}...")
-            
-            # Add tags for special types
-            if result["is_mane"]:
-                radio.setText(radio.text() + " (MANE Select)")
-                radio.setChecked(True)  # Auto-select MANE Select
-                self.selected_result_id = result["id"]
-            elif result["is_refseq"]:
-                radio.setText(radio.text() + " (RefSeq)")
-            
-            radio.setProperty("result_id", result["id"])
-            radio.toggled.connect(self.on_selection_changed)
-            self.selection_layout.addWidget(radio)
-            self.radio_group.addButton(radio)
-        
-        # If no MANE Select or RefSeq selected, select the first one
-        if self.selected_result_id is None and results:
-            first_radio = self.radio_group.buttons()[0]
-            first_radio.setChecked(True)
-            self.selected_result_id = results[0]["id"]
-        
-        # Update status
-        self.status_label.setText(f"Found {len(results)} sequences. Select one to download.")
-        self.progress_bar.setVisible(False)
-        self.download_button.setEnabled(True)
-    
-    def on_selection_changed(self):
-        """Handle selection of a sequence"""
-        sender = self.sender()
-        if sender.isChecked():
-            self.selected_result_id = sender.property("result_id")
-            self.download_button.setEnabled(True)
-    
-    def clear_selection_widgets(self):
-        """Clear the selection radio buttons"""
-        # Remove all widgets from selection layout
-        while self.selection_layout.count():
-            item = self.selection_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-    
-    def download_sequence(self):
-        """Download the selected sequence"""
-        if not self.selected_result_id:
-            QMessageBox.warning(self, "Selection Error", "Please select a sequence to download.")
-            return
-        
-        email = self.email_input.text().strip()
-        seq_length = self.length_input.value()
-        
-        # Create output directory in the current working directory if it doesn't exist
-        output_dir = "downloaded_sequences"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Update status
-        self.status_label.setText("Downloading sequence...")
-        self.progress_bar.setVisible(True)
-        self.download_button.setEnabled(False)  # Disable button during download
-        
-        # Create and start the download thread
-        self.download_thread = SequenceDownloadThread(self.selected_result_id, seq_length, email, output_dir)
-        self.download_thread.finished_signal.connect(self.handle_download_finished)
-        self.download_thread.error_signal.connect(self.handle_error)
-        
-        # Connect to the new progress signal
-        self.download_thread.progress_signal.connect(self.update_status)
-        
-        self.download_thread.start()
+        return right_widget
 
-    def update_status(self, message):
-        """Update the status label with progress messages"""
-        self.status_label.setText(message)
-        # Also log to the results display for a record
-        self.results_display.append(f"[Status] {message}")
-
-    def handle_download_finished(self, filepath):
-        """Handle completion of the download"""
-        self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Sequence downloaded to {filepath}")
-        self.download_button.setEnabled(True)  # Re-enable the button
-        self.send_to_alphafold_button.setEnabled(True)  # Enable send to AlphaFold button
-        
-        # Store the filepath for later use
-        self.current_fasta_path = filepath
-        
-        # Read a bit of the file to confirm content
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                file_preview = f.read(200)  # Read first 200 chars
-            
-            # Show success message with file preview
-            QMessageBox.information(self, "Download Complete", 
-                                  f"The sequence has been downloaded successfully to:\n{filepath}\n\n"
-                                  f"Preview of file content:\n{file_preview}")
-        except Exception as e:
-            QMessageBox.warning(self, "Download Issue", 
-                              f"File was created but there may be issues with it: {str(e)}")
-    
-    def handle_error(self, error_message):
-        """Handle errors from worker threads"""
-        self.progress_bar.setVisible(False)
-        self.status_label.setText("Error occurred")
-        self.download_button.setEnabled(True)  # Re-enable the button
-        
-        # Show error dialog with details
-        error_dialog = QMessageBox()
-        error_dialog.setIcon(QMessageBox.Icon.Critical)
-        error_dialog.setText("An error occurred during the operation")
-        error_dialog.setInformativeText(error_message)
-        error_dialog.setWindowTitle("Error")
-        error_dialog.setDetailedText(error_message)
-        error_dialog.exec()
-        
-        # Also log the error to the results display
-        self.results_display.append(f"[ERROR] {error_message}")
-    
-    def send_to_alphafold(self):
-        """Send the downloaded sequence to the AlphaFold tab"""
-        if not self.current_fasta_path:
-            QMessageBox.warning(self, "Error", "No sequence has been downloaded yet.")
-            return
-        
-        # Update the file path label
-        self.file_path_label.setText(self.current_fasta_path)
-        
-        # Enable the find ROI button
-        self.find_roi_button.setEnabled(True)
-        
-        # Optionally automatically find the ROI
-        self.find_roi()
-    
     def load_fasta_file(self):
         """Load a FASTA file through file dialog"""
         file_path, _ = QFileDialog.getOpenFileName(self, "Open FASTA File", "", "FASTA Files (*.fasta *.fa);;All Files (*)")
@@ -621,7 +837,7 @@ class MainWindow(QMainWindow):
                           self.alphafold_password.text().strip() != "")
         
         self.submit_button.setEnabled(has_roi and has_protein and has_credentials)
-    
+
     def submit_to_alphafold(self):
         """Submit the sequence data to AlphaFold 3"""
         # Get credentials
@@ -774,3 +990,238 @@ class MainWindow(QMainWindow):
         finally:
             self.status_label.setText("Ready")
             self.progress_bar.setVisible(False)
+
+    # BULK DOWNLOAD METHODS
+    
+    def browse_excel_file(self):
+        """Browse for Excel file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select Excel File", 
+            "", 
+            "Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        
+        if file_path:
+            self.excel_path_label.setText(file_path)
+            self.load_excel_button.setEnabled(True)
+    
+    def browse_output_directory(self):
+        """Browse for output directory"""
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        
+        if dir_path:
+            self.output_dir_label.setText(dir_path)
+    
+    def load_excel_file(self):
+        """Load gene list from Excel file"""
+        excel_path = self.excel_path_label.text()
+        if excel_path == "No file selected":
+            QMessageBox.warning(self, "Error", "Please select an Excel file first.")
+            return
+        
+        # Get column settings
+        gene_column = self.gene_column_combo.currentIndex()
+        
+        organism_column = None
+        if self.organism_column_combo.currentText() != "None":
+            organism_column = self.organism_column_combo.currentIndex() - 1
+        
+        status_column = None
+        if self.status_column_combo.currentText() != "None":
+            status_column = self.status_column_combo.currentIndex() - 1
+        
+        # Start loading thread
+        self.excel_load_thread = ExcelLoadThread(
+            excel_path, gene_column, organism_column, status_column
+        )
+        self.excel_load_thread.finished_signal.connect(self.on_excel_loaded)
+        self.excel_load_thread.error_signal.connect(self.handle_error)
+        self.excel_load_thread.progress_signal.connect(self.update_bulk_status)
+        self.excel_load_thread.start()
+        
+        # Disable load button during loading
+        self.load_excel_button.setEnabled(False)
+        self.load_excel_button.setText("Loading...")
+    
+    def on_excel_loaded(self, gene_list):
+        """Handle successful Excel loading"""
+        self.current_gene_list = gene_list
+        self.load_excel_button.setEnabled(True)
+        self.load_excel_button.setText("Load Gene List")
+        
+        # Update gene count
+        self.gene_count_label.setText(f"Genes loaded: {len(gene_list)}")
+        
+        # Populate gene table
+        self.populate_gene_table(gene_list)
+        
+        # Update button state (this will check both genes and email)
+        self.update_bulk_download_button_state()
+        
+        self.update_bulk_status(f"Successfully loaded {len(gene_list)} genes")
+    
+    def populate_gene_table(self, gene_list):
+        """Populate the gene table with loaded genes"""
+        self.gene_table.setRowCount(min(len(gene_list), 50))  # Show max 50 rows
+        
+        for i, gene_info in enumerate(gene_list[:50]):  # Limit display to first 50
+            self.gene_table.setItem(i, 0, QTableWidgetItem(gene_info['gene_name']))
+            self.gene_table.setItem(i, 1, QTableWidgetItem(gene_info['organism']))
+            self.gene_table.setItem(i, 2, QTableWidgetItem(gene_info.get('status', '')))
+            self.gene_table.setItem(i, 3, QTableWidgetItem(str(gene_info['row_index'])))
+        
+        if len(gene_list) > 50:
+            self.update_bulk_status(f"Showing first 50 of {len(gene_list)} genes in table")
+    
+    def start_bulk_download(self):
+        """Start the bulk download process"""
+        if not self.current_gene_list:
+            QMessageBox.warning(self, "Error", "Please load a gene list first.")
+            return
+        
+        email = self.bulk_email_input.text().strip()
+        if not email or '@' not in email:
+            QMessageBox.warning(self, "Error", "Please enter a valid email address.")
+            return
+        
+        # Get settings
+        output_dir = self.output_dir_label.text()
+        seq_length = self.bulk_length_input.value()
+        delay = self.delay_input.value()
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Start bulk download thread
+        self.bulk_download_thread = BulkDownloadThread(
+            email, self.current_gene_list, output_dir, seq_length, delay, max_retries=3
+        )
+        
+        self.bulk_download_thread.progress_signal.connect(self.update_bulk_progress)
+        self.bulk_download_thread.finished_signal.connect(self.on_bulk_download_finished)
+        self.bulk_download_thread.error_signal.connect(self.handle_bulk_error)
+        self.bulk_download_thread.start()
+        
+        # Update UI
+        self.start_bulk_button.setEnabled(True)
+        self.stop_bulk_button.setEnabled(True)
+        self.load_excel_button.setEnabled(False)
+        self.update_bulk_status("Starting bulk download...")
+        
+        # Clear previous log
+        self.bulk_log.clear()
+    
+    def stop_bulk_download(self):
+        """Stop the bulk download process"""
+        if self.bulk_download_thread:
+            self.bulk_download_thread.stop()
+            self.update_bulk_status("Stopping bulk download...")
+            self.stop_bulk_button.setEnabled(False)
+    
+    def retry_failed_downloads(self):
+        """Retry failed downloads from a previous summary file"""
+        summary_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Summary File",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if not summary_file:
+            return
+        
+        email = self.bulk_email_input.text().strip()
+        if not email or '@' not in email:
+            QMessageBox.warning(self, "Error", "Please enter a valid email address.")
+            return
+        
+        output_dir = self.output_dir_label.text()
+        
+        # Start retry thread
+        self.retry_thread = RetryFailedThread(email, summary_file, output_dir)
+        self.retry_thread.progress_signal.connect(self.update_bulk_progress)
+        self.retry_thread.finished_signal.connect(self.on_retry_finished)
+        self.retry_thread.error_signal.connect(self.handle_bulk_error)
+        self.retry_thread.start()
+        
+        # Update UI
+        self.retry_failed_button.setEnabled(False)
+        self.update_bulk_status("Retrying failed downloads...")
+    
+    def update_bulk_progress(self, current, total, message):
+        """Update bulk download progress"""
+        self.bulk_progress_bar.setMaximum(total)
+        self.bulk_progress_bar.setValue(current)
+        self.update_bulk_status(message)
+        
+        # Update stats
+        downloaded = current
+        failed = 0  # This would be updated from the actual thread if needed
+        self.bulk_stats_label.setText(f"Downloaded: {downloaded} | Failed: {failed}")
+    
+    def update_bulk_status(self, message):
+        """Update bulk status label and log"""
+        self.bulk_status_label.setText(message)
+        self.bulk_log.append(f"[{QTimer().remainingTime()}] {message}")
+        
+        # Auto-scroll to bottom
+        scrollbar = self.bulk_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def on_bulk_download_finished(self, summary):
+        """Handle bulk download completion"""
+        # Reset UI
+        self.start_bulk_button.setEnabled(True)
+        self.stop_bulk_button.setEnabled(False)
+        self.load_excel_button.setEnabled(True)
+        self.retry_failed_button.setEnabled(True)
+        
+        # Update final stats
+        successful = summary['successful_downloads']
+        failed = summary['failed_downloads']
+        total = summary['total_genes']
+        
+        self.bulk_stats_label.setText(f"Downloaded: {successful} | Failed: {failed}")
+        self.update_bulk_status(f"Bulk download completed! {successful}/{total} successful")
+        
+        # Show completion message
+        QMessageBox.information(
+            self,
+            "Bulk Download Complete",
+            f"Bulk download completed!\n\n"
+            f"Total genes: {total}\n"
+            f"Successful downloads: {successful}\n"
+            f"Failed downloads: {failed}\n\n"
+            f"Results saved to: {summary['output_directory']}"
+        )
+    
+    def on_retry_finished(self, updated_summary):
+        """Handle retry completion"""
+        self.retry_failed_button.setEnabled(True)
+        
+        retry_successful = updated_summary.get('retry_successful', 0)
+        still_failed = updated_summary.get('still_failed', 0)
+        
+        self.update_bulk_status(f"Retry completed! {retry_successful} additional downloads successful")
+        
+        QMessageBox.information(
+            self,
+            "Retry Complete",
+            f"Retry completed!\n\n"
+            f"Additional successful downloads: {retry_successful}\n"
+            f"Still failed: {still_failed}"
+        )
+    
+    def handle_bulk_error(self, error_message):
+        """Handle bulk download errors"""
+        # Reset UI
+        self.start_bulk_button.setEnabled(True)
+        self.stop_bulk_button.setEnabled(False)
+        self.load_excel_button.setEnabled(True)
+        self.retry_failed_button.setEnabled(True)
+        
+        self.update_bulk_status("Error occurred during bulk download")
+        
+        # Show error dialog
+        QMessageBox.critical(self, "Bulk Download Error", error_message)
