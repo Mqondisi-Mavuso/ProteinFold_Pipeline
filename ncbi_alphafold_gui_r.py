@@ -5,7 +5,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QLineEdit, QPushButton, QRadioButton, QGroupBox, 
                              QTextEdit, QSpinBox, QMessageBox, QProgressBar, QButtonGroup,
                              QSplitter, QFileDialog, QTabWidget, QCheckBox, QComboBox,
-                             QTableWidget, QTableWidgetItem, QHeaderView)
+                             QTableWidget, QTableWidgetItem, QHeaderView,
+                             QScrollArea, QTabWidget)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
@@ -16,6 +17,40 @@ from alphafold_crawler_2 import AlphaFoldSubmitter
 import pandas as pd
 from pathlib import Path
 from ncbi_bulk_threads import BulkPreprocessingThread
+
+from protein_roi_loader import (
+    ProteinDataLoader, ROIDataLoader, JobPairGenerator, 
+    DataValidator, load_and_validate_protein_data, 
+    load_and_validate_roi_data, create_job_batch
+)
+from alphafold_batch_handler import AlphaFoldBatchHandler
+from datetime import datetime
+from alphafold_login import AlphaFoldLogin
+
+# Configuration constants you can adjust
+class BatchConfig:
+    # Job timing (in seconds)
+    JOB_SUBMISSION_DELAY = 30  # Delay between job submissions
+    STATUS_CHECK_INTERVAL = 60  # How often to check job status
+    
+    # Job limits
+    DEFAULT_DAILY_LIMIT = 30  # Default daily job limit
+    MAX_DAILY_LIMIT = 100     # Maximum daily job limit
+    
+    # Sequence validation
+    MIN_PROTEIN_LENGTH = 10   # Minimum protein sequence length
+    MAX_PROTEIN_LENGTH = 2000 # Maximum recommended protein length
+    MIN_DNA_LENGTH = 10       # Minimum DNA sequence length
+    MAX_DNA_LENGTH = 500      # Maximum recommended DNA length
+    
+    # File paths
+    RESULTS_BASE_DIR = "alphafold_batch_results"
+    LOG_DIR = "batch_logs"
+    TEMP_DIR = "temp_files"
+    
+    # AlphaFold settings
+    USE_MULTIMER_MODEL = False  # Whether to use multimer model by default
+    SAVE_ALL_MODELS = True      # Whether to save all 5 models
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -37,6 +72,14 @@ class MainWindow(QMainWindow):
         self.roi_found_label = None
         self.results_table = None
         self.export_results_button = None
+
+        # AlphaFold 3 Bulk Uploading
+        self.protein_data = []
+        self.selected_protein = None
+        self.roi_data = []
+        self.batch_jobs = []
+        self.current_job_index = 0
+        self.batch_handler = None 
         
         # Store search results
         self.search_results = []
@@ -44,6 +87,10 @@ class MainWindow(QMainWindow):
         self.current_fasta_path = None
         self.roi_sequence = None
         self.protein_sequence_text = None
+
+        # AlphaFold login variables
+        self.alphafold_login_handler = None
+        self.is_logged_in = False
         
         # Bulk download variables
         self.current_gene_list = []
@@ -75,7 +122,7 @@ class MainWindow(QMainWindow):
         ncbi_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         left_layout.addWidget(ncbi_title)
         
-        # Create tabs for single and bulk download
+        # Create tabs for single and bulk download (LEFT SIDE TABS)
         ncbi_tabs = QTabWidget()
         left_layout.addWidget(ncbi_tabs)
         
@@ -87,7 +134,7 @@ class MainWindow(QMainWindow):
         bulk_tab = self.create_bulk_download_tab()
         ncbi_tabs.addTab(bulk_tab, "Bulk Download")
         
-        # Right side - AlphaFold Predictor (unchanged)
+        # Right side - AlphaFold Predictor (this creates its own internal tabs)
         right_widget = self.create_alphafold_tab()
         
         # Add widgets to splitter
@@ -568,6 +615,111 @@ class MainWindow(QMainWindow):
         # Optionally automatically find the ROI
         self.find_roi()
     
+    # Additional helper method for the protein management tab
+    def create_protein_management_tab(self):
+        """Create the protein sequence management tab (Updated version)"""
+        protein_widget = QWidget()
+        protein_layout = QVBoxLayout(protein_widget)
+        
+        # Protein Excel Loading Section
+        excel_group = QGroupBox("Load Protein Sequences from Excel")
+        excel_layout = QVBoxLayout()
+        
+        # File selection
+        file_select_layout = QHBoxLayout()
+        self.protein_excel_label = QLabel("No file selected")
+        self.browse_protein_excel_button = QPushButton("Browse Excel File")
+        self.browse_protein_excel_button.clicked.connect(self.browse_protein_excel_file)
+        file_select_layout.addWidget(QLabel("Protein Excel File:"))
+        file_select_layout.addWidget(self.protein_excel_label)
+        file_select_layout.addWidget(self.browse_protein_excel_button)
+        excel_layout.addLayout(file_select_layout)
+        
+        # Column configuration
+        col_config_layout = QHBoxLayout()
+        col_config_layout.addWidget(QLabel("Protein Name Column:"))
+        self.protein_name_column_combo = QComboBox()
+        self.protein_name_column_combo.addItems(["Column A (0)", "Column B (1)", "Column C (2)", "Column D (3)"])
+        col_config_layout.addWidget(self.protein_name_column_combo)
+        
+        col_config_layout.addWidget(QLabel("Protein Sequence Column:"))
+        self.protein_seq_column_combo = QComboBox()
+        self.protein_seq_column_combo.addItems(["Column A (0)", "Column B (1)", "Column C (2)", "Column D (3)"])
+        self.protein_seq_column_combo.setCurrentText("Column B (1)")
+        col_config_layout.addWidget(self.protein_seq_column_combo)
+        
+        excel_layout.addLayout(col_config_layout)
+        
+        # Load button
+        self.load_protein_excel_button = QPushButton("Load Protein Sequences")
+        self.load_protein_excel_button.clicked.connect(self.load_protein_excel_file)
+        self.load_protein_excel_button.setEnabled(False)
+        excel_layout.addWidget(self.load_protein_excel_button)
+        
+        excel_group.setLayout(excel_layout)
+        protein_layout.addWidget(excel_group)
+        
+        # Protein Selection Section
+        selection_group = QGroupBox("Select Protein for AlphaFold Prediction")
+        selection_layout = QVBoxLayout()
+        
+        # Info and export buttons
+        info_layout = QHBoxLayout()
+        self.protein_count_label = QLabel("Proteins loaded: 0")
+        info_layout.addWidget(self.protein_count_label)
+        info_layout.addStretch()
+        
+        self.export_proteins_button = QPushButton("Export Protein Summary")
+        self.export_proteins_button.clicked.connect(self.export_protein_summary)
+        self.export_proteins_button.setEnabled(False)
+        info_layout.addWidget(self.export_proteins_button)
+        
+        selection_layout.addLayout(info_layout)
+        
+        # Radio button container
+        self.protein_radio_container = QWidget()
+        self.protein_radio_layout = QVBoxLayout(self.protein_radio_container)
+        self.protein_radio_group = QButtonGroup(self)
+        
+        # Scroll area for protein selection
+        protein_scroll = QScrollArea()
+        protein_scroll.setWidget(self.protein_radio_container)
+        protein_scroll.setWidgetResizable(True)
+        protein_scroll.setMaximumHeight(250)
+        selection_layout.addWidget(protein_scroll)
+        
+        selection_group.setLayout(selection_layout)
+        protein_layout.addWidget(selection_group)
+        
+        # Selected Protein Preview
+        preview_group = QGroupBox("Selected Protein Details")
+        preview_layout = QVBoxLayout()
+        
+        # Protein info display
+        info_layout = QHBoxLayout()
+        self.selected_protein_name_label = QLabel("Name: None selected")
+        self.selected_protein_length_label = QLabel("Length: 0 AA")
+        info_layout.addWidget(self.selected_protein_name_label)
+        info_layout.addWidget(self.selected_protein_length_label)
+        info_layout.addStretch()
+        preview_layout.addLayout(info_layout)
+        
+        # Protein sequence preview
+        preview_layout.addWidget(QLabel("Sequence Preview:"))
+        self.protein_sequence_preview = QTextEdit()
+        self.protein_sequence_preview.setReadOnly(True)
+        self.protein_sequence_preview.setMaximumHeight(120)
+        preview_layout.addWidget(self.protein_sequence_preview)
+        
+        preview_group.setLayout(preview_layout)
+        protein_layout.addWidget(preview_group)
+        
+        # Initialize variables
+        self.protein_data = []
+        self.selected_protein = None
+        
+        return protein_widget
+
     def create_alphafold_tab(self):
         """Create the AlphaFold tab with updated preprocessing functionality"""
         right_widget = QWidget()
@@ -582,7 +734,7 @@ class MainWindow(QMainWindow):
         tab_widget = QTabWidget()
         right_layout.addWidget(tab_widget)
         
-        # Tab 1: Sequence Pre-processor (UPDATED WITH TABBED INTERFACE)
+        # Tab 1: Sequence Pre-processor (existing functionality with sub-tabs)
         preprocessor_tab = QWidget()
         preprocessor_layout = QVBoxLayout(preprocessor_tab)
         
@@ -590,11 +742,11 @@ class MainWindow(QMainWindow):
         preprocess_tabs = QTabWidget()
         preprocessor_layout.addWidget(preprocess_tabs)
         
-        # Single File Processing Tab (existing functionality)
+        # Single File Processing Tab
         single_process_tab = QWidget()
         single_layout = QVBoxLayout(single_process_tab)
         
-        # File loading section (existing)
+        # File loading section
         file_group = QGroupBox("Load FASTA Sequence")
         file_layout = QVBoxLayout()
         
@@ -608,7 +760,7 @@ class MainWindow(QMainWindow):
         file_buttons_layout.addWidget(self.paste_sequence_button)
         file_layout.addLayout(file_buttons_layout)
         
-        # Display loaded file path (existing)
+        # Display loaded file path
         path_layout = QHBoxLayout()
         path_layout.addWidget(QLabel("Current File:"))
         self.file_path_label = QLabel("No file loaded")
@@ -619,14 +771,13 @@ class MainWindow(QMainWindow):
         file_group.setLayout(file_layout)
         single_layout.addWidget(file_group)
         
-        # ROI finder section (existing)
+        # ROI finder section
         roi_group = QGroupBox("Region of Interest (ROI) Finder")
         roi_layout = QVBoxLayout()
         
-        # ROI input (existing)
         roi_input_layout = QHBoxLayout()
         roi_input_layout.addWidget(QLabel("ROI Pattern:"))
-        self.roi_input = QLineEdit("CACCTG")  # Updated default ROI
+        self.roi_input = QLineEdit("CACCTG")
         roi_input_layout.addWidget(self.roi_input)
         self.find_roi_button = QPushButton("Find ROI")
         self.find_roi_button.clicked.connect(self.find_roi)
@@ -634,7 +785,6 @@ class MainWindow(QMainWindow):
         roi_input_layout.addWidget(self.find_roi_button)
         roi_layout.addLayout(roi_input_layout)
         
-        # ROI results (existing)
         roi_layout.addWidget(QLabel("Found ROI Sub-Sequence:"))
         self.roi_result = QTextEdit()
         self.roi_result.setReadOnly(True)
@@ -646,7 +796,7 @@ class MainWindow(QMainWindow):
         
         preprocess_tabs.addTab(single_process_tab, "Single File")
         
-        # Bulk Processing Tab (NEW)
+        # Bulk Processing Tab
         bulk_process_tab = QWidget()
         bulk_layout = QVBoxLayout(bulk_process_tab)
         
@@ -688,18 +838,15 @@ class MainWindow(QMainWindow):
         control_group = QGroupBox("Processing Controls")
         control_layout = QVBoxLayout()
         
-        # Process button
         self.process_directory_button = QPushButton("Process All FASTA Files")
         self.process_directory_button.clicked.connect(self.process_fasta_directory)
         self.process_directory_button.setEnabled(False)
         self.process_directory_button.setMinimumHeight(40)
         control_layout.addWidget(self.process_directory_button)
         
-        # Progress bar
         self.preprocessing_progress = QProgressBar()
         control_layout.addWidget(self.preprocessing_progress)
         
-        # Status label
         self.preprocessing_status = QLabel("Ready to process FASTA files")
         control_layout.addWidget(self.preprocessing_status)
         
@@ -710,7 +857,6 @@ class MainWindow(QMainWindow):
         results_group = QGroupBox("Processing Results")
         results_layout = QVBoxLayout()
         
-        # Summary info
         summary_layout = QHBoxLayout()
         self.files_processed_label = QLabel("Files processed: 0")
         self.roi_found_label = QLabel("ROI sequences found: 0")
@@ -719,13 +865,11 @@ class MainWindow(QMainWindow):
         summary_layout.addStretch()
         results_layout.addLayout(summary_layout)
         
-        # Results table preview
         results_layout.addWidget(QLabel("Summary Preview (first 10 rows):"))
         self.results_table = QTableWidget()
         self.results_table.setMaximumHeight(200)
         results_layout.addWidget(self.results_table)
         
-        # Export button
         self.export_results_button = QPushButton("Export Full Results to Excel")
         self.export_results_button.clicked.connect(self.export_preprocessing_results)
         self.export_results_button.setEnabled(False)
@@ -736,7 +880,7 @@ class MainWindow(QMainWindow):
         
         preprocess_tabs.addTab(bulk_process_tab, "Bulk Processing")
         
-        # Add the remaining existing content (protein sequence section)
+        # Add protein sequence section to preprocessing tab
         protein_group = QGroupBox("Protein Sequence")
         protein_layout = QVBoxLayout()
         
@@ -751,86 +895,15 @@ class MainWindow(QMainWindow):
         # Add the preprocessor tab
         tab_widget.addTab(preprocessor_tab, "Sequence Pre-processor")
         
-        # Tab 2: AlphaFold Submission
-        submission_tab = QWidget()
-        submission_layout = QVBoxLayout(submission_tab)
+        # Tab 2: Protein Sequences (NEW - this was missing!)
+        protein_tab = self.create_protein_management_tab()
+        tab_widget.addTab(protein_tab, "Protein Sequences")
         
-        # AlphaFold credentials
-        creds_group = QGroupBox("AlphaFold 3 Credentials")
-        creds_layout = QVBoxLayout()
-        
-        email_layout = QHBoxLayout()
-        email_layout.addWidget(QLabel("Gmail Account:"))
-        self.alphafold_email = QLineEdit()
-        self.alphafold_email.textChanged.connect(self.update_submit_button)
-        email_layout.addWidget(self.alphafold_email)
-        creds_layout.addLayout(email_layout)
-        
-        password_layout = QHBoxLayout()
-        password_layout.addWidget(QLabel("Password:"))
-        self.alphafold_password = QLineEdit()
-        self.alphafold_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.alphafold_password.textChanged.connect(self.update_submit_button)
-        password_layout.addWidget(self.alphafold_password)
-        creds_layout.addLayout(password_layout)
-        
-        save_creds = QCheckBox("Save credentials (stored locally)")
-        creds_layout.addWidget(save_creds)
-        
-        creds_group.setLayout(creds_layout)
-        submission_layout.addWidget(creds_group)
-        
-        # Submission settings
-        settings_group = QGroupBox("Submission Settings")
-        settings_layout = QVBoxLayout()
-        
-        # Job name
-        job_name_layout = QHBoxLayout()
-        job_name_layout.addWidget(QLabel("Job Name:"))
-        self.job_name_input = QLineEdit("Protein-DNA Complex")
-        job_name_layout.addWidget(self.job_name_input)
-        settings_layout.addLayout(job_name_layout)
-        
-        # Job options
-        self.multimer_model = QCheckBox("Use multimer model")
-        settings_layout.addWidget(self.multimer_model)
-        
-        self.save_all_models = QCheckBox("Save all 5 models")
-        settings_layout.addWidget(self.save_all_models)
-        
-        settings_group.setLayout(settings_layout)
-        submission_layout.addWidget(settings_group)
-        
-        # Sequences review
-        review_group = QGroupBox("Sequences for Submission")
-        review_layout = QVBoxLayout()
-        
-        review_layout.addWidget(QLabel("DNA Sequence (ROI Sub-Sequence):"))
-        self.dna_review = QTextEdit()
-        self.dna_review.setReadOnly(True)
-        self.dna_review.setMaximumHeight(80)
-        review_layout.addWidget(self.dna_review)
-        
-        review_layout.addWidget(QLabel("Protein Sequence:"))
-        self.protein_review = QTextEdit()
-        self.protein_review.setReadOnly(True)
-        self.protein_review.setMaximumHeight(80)
-        review_layout.addWidget(self.protein_review)
-        
-        review_group.setLayout(review_layout)
-        submission_layout.addWidget(review_group)
-        
-        # Submit button
-        self.submit_button = QPushButton("Submit to AlphaFold 3")
-        self.submit_button.clicked.connect(self.submit_to_alphafold)
-        self.submit_button.setMinimumHeight(50)
-        self.submit_button.setEnabled(False)
-        submission_layout.addWidget(self.submit_button)
-        
-        # Add the submission tab
+        # Tab 3: AlphaFold Submission (UPDATED)
+        submission_tab = self.create_submission_tab()
         tab_widget.addTab(submission_tab, "AlphaFold Submission")
         
-        # Tab 3: Results Viewer
+        # Tab 4: Results Viewer
         results_tab = QWidget()
         results_layout = QVBoxLayout(results_tab)
         
@@ -851,11 +924,9 @@ class MainWindow(QMainWindow):
         
         results_layout.addLayout(results_buttons_layout)
         
-        # Add the results tab
         tab_widget.addTab(results_tab, "Results")
         
         return right_widget
-
 
     def load_fasta_file(self):
         """Load a FASTA file through file dialog"""
@@ -1472,6 +1543,191 @@ class MainWindow(QMainWindow):
             f"An error occurred during bulk preprocessing:\n\n{error_message}"
         )
 
+    def create_submission_tab(self):
+        """Create the AlphaFold submission tab with job management and login functionality"""
+        submission_widget = QWidget()
+        submission_layout = QVBoxLayout(submission_widget)
+        
+        # AlphaFold Login Section (NEW)
+        login_group = QGroupBox("AlphaFold 3 Authentication")
+        login_layout = QVBoxLayout()
+        
+        # Login status display
+        status_layout = QHBoxLayout()
+        self.login_status_label = QLabel("Status: Not logged in")
+        self.login_status_label.setStyleSheet("color: red; font-weight: bold;")
+        status_layout.addWidget(self.login_status_label)
+        status_layout.addStretch()
+        login_layout.addLayout(status_layout)
+        
+        # Login buttons
+        login_buttons_layout = QHBoxLayout()
+        
+        self.manual_login_button = QPushButton("Manual Login & Save Cookies")
+        self.manual_login_button.clicked.connect(self.perform_manual_login)
+        self.manual_login_button.setMinimumHeight(35)
+        self.manual_login_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        login_buttons_layout.addWidget(self.manual_login_button)
+        
+        self.auto_login_button = QPushButton("Login with Saved Cookies")
+        self.auto_login_button.clicked.connect(self.perform_auto_login)
+        self.auto_login_button.setMinimumHeight(35)
+        self.auto_login_button.setEnabled(False)
+        login_buttons_layout.addWidget(self.auto_login_button)
+        
+        self.check_login_button = QPushButton("Check Login Status")
+        self.check_login_button.clicked.connect(self.check_login_status)
+        login_buttons_layout.addWidget(self.check_login_button)
+        
+        login_layout.addLayout(login_buttons_layout)
+        
+        # Login instructions
+        instructions = QLabel(
+            "Instructions:\n"
+            "1. First time: Click 'Manual Login & Save Cookies' and complete Google login in browser\n"
+            "2. Future logins: Click 'Login with Saved Cookies' for automatic authentication\n"
+            "3. If cookies expire, repeat step 1"
+        )
+        instructions.setStyleSheet("color: #666; font-size: 11px; margin: 10px;")
+        instructions.setWordWrap(True)
+        login_layout.addWidget(instructions)
+        
+        login_group.setLayout(login_layout)
+        submission_layout.addWidget(login_group)
+        
+        # ROI Data Loading Section
+        roi_group = QGroupBox("ROI Data Configuration")
+        roi_layout = QVBoxLayout()
+        
+        # ROI Excel file selection
+        roi_file_layout = QHBoxLayout()
+        self.roi_excel_label = QLabel("No ROI file selected")
+        self.browse_roi_excel_button = QPushButton("Browse ROI Excel")
+        self.browse_roi_excel_button.clicked.connect(self.browse_roi_excel_file)
+        roi_file_layout.addWidget(QLabel("ROI Excel File:"))
+        roi_file_layout.addWidget(self.roi_excel_label)
+        roi_file_layout.addWidget(self.browse_roi_excel_button)
+        roi_layout.addLayout(roi_file_layout)
+        
+        # ROI info
+        self.roi_count_label = QLabel("ROI sequences loaded: 0")
+        roi_layout.addWidget(self.roi_count_label)
+        
+        roi_group.setLayout(roi_layout)
+        submission_layout.addWidget(roi_group)
+        
+        # Job Management Section
+        job_group = QGroupBox("Batch Job Management")
+        job_layout = QVBoxLayout()
+        
+        # Job limit and validation
+        limit_layout = QHBoxLayout()
+        limit_layout.addWidget(QLabel("Daily Job Limit:"))
+        self.job_limit_input = QSpinBox()
+        self.job_limit_input.setRange(1, 100)
+        self.job_limit_input.setValue(30)
+        limit_layout.addWidget(self.job_limit_input)
+        limit_layout.addWidget(QLabel("jobs per day"))
+        
+        # Add validation button
+        self.validate_setup_button = QPushButton("Validate Setup")
+        self.validate_setup_button.clicked.connect(self.validate_current_setup)
+        self.validate_setup_button.setEnabled(False)  # Disabled until logged in
+        limit_layout.addWidget(self.validate_setup_button)
+        limit_layout.addStretch()
+        job_layout.addLayout(limit_layout)
+        
+        # Job summary
+        summary_layout = QHBoxLayout()
+        self.total_jobs_label = QLabel("Total jobs to submit: 0")
+        self.jobs_completed_label = QLabel("Jobs completed: 0")
+        summary_layout.addWidget(self.total_jobs_label)
+        summary_layout.addWidget(self.jobs_completed_label)
+        summary_layout.addStretch()
+        job_layout.addLayout(summary_layout)
+        
+        # Export and batch controls
+        controls_layout = QHBoxLayout()
+        
+        self.export_plan_button = QPushButton("Export Job Plan")
+        self.export_plan_button.clicked.connect(self.export_job_plan)
+        self.export_plan_button.setEnabled(False)
+        controls_layout.addWidget(self.export_plan_button)
+        
+        self.start_batch_button = QPushButton("Start Batch Submission")
+        self.start_batch_button.clicked.connect(self.start_batch_submission)
+        self.start_batch_button.setEnabled(False)
+        self.start_batch_button.setMinimumHeight(40)
+        self.start_batch_button.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        controls_layout.addWidget(self.start_batch_button)
+        
+        self.stop_batch_button = QPushButton("Stop Batch")
+        self.stop_batch_button.clicked.connect(self.stop_batch_submission)
+        self.stop_batch_button.setEnabled(False)
+        controls_layout.addWidget(self.stop_batch_button)
+        
+        self.resume_batch_button = QPushButton("Resume Batch")
+        self.resume_batch_button.clicked.connect(self.resume_batch_submission)
+        self.resume_batch_button.setEnabled(False)
+        controls_layout.addWidget(self.resume_batch_button)
+        
+        job_layout.addLayout(controls_layout)
+        
+        job_group.setLayout(job_layout)
+        submission_layout.addWidget(job_group)
+        
+        # Progress Section
+        progress_group = QGroupBox("Batch Progress")
+        progress_layout = QVBoxLayout()
+        
+        # Progress bar
+        self.batch_progress_bar = QProgressBar()
+        progress_layout.addWidget(self.batch_progress_bar)
+        
+        # Status and current job info
+        status_layout = QHBoxLayout()
+        self.batch_status_label = QLabel("Ready for batch submission")
+        self.current_job_label = QLabel("Current job: None")
+        status_layout.addWidget(self.batch_status_label)
+        status_layout.addWidget(self.current_job_label)
+        progress_layout.addLayout(status_layout)
+        
+        # Batch log with controls
+        log_controls_layout = QHBoxLayout()
+        log_controls_layout.addWidget(QLabel("Batch Log:"))
+        log_controls_layout.addStretch()
+        
+        self.clear_log_button = QPushButton("Clear Log")
+        self.clear_log_button.clicked.connect(lambda: self.batch_log.clear())
+        log_controls_layout.addWidget(self.clear_log_button)
+        
+        self.save_log_button = QPushButton("Save Log")
+        self.save_log_button.clicked.connect(self.save_batch_log)
+        log_controls_layout.addWidget(self.save_log_button)
+        
+        progress_layout.addLayout(log_controls_layout)
+        
+        self.batch_log = QTextEdit()
+        self.batch_log.setReadOnly(True)
+        self.batch_log.setMaximumHeight(200)
+        progress_layout.addWidget(self.batch_log)
+        
+        progress_group.setLayout(progress_layout)
+        submission_layout.addWidget(progress_group)
+        
+        # Initialize variables
+        self.roi_data = []
+        self.batch_jobs = []
+        self.current_job_index = 0
+        self.batch_handler = None
+        self.alphafold_login_handler = None  # NEW: Store login handler
+        self.is_logged_in = False  # NEW: Track login status
+        
+        # Check if cookies exist on startup
+        self.check_existing_cookies()
+        
+        return submission_widget
+
     # 2. FIXED export_preprocessing_results function in ncbi_alphafold_gui_r.py
     def export_preprocessing_results(self):
         """Export the full preprocessing results to Excel (append to existing file)"""
@@ -1579,3 +1835,699 @@ class MainWindow(QMainWindow):
                 "Export Error",
                 f"Error saving results to Excel:\n\n{str(e)}"
             )
+    
+    ######################################### New Code~~~~~~~~~~~~~~~~~~~~
+    def browse_protein_excel_file(self):
+        """Browse for protein Excel file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select Protein Excel File", 
+            "", 
+            "Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        
+        if file_path:
+            self.protein_excel_label.setText(file_path)
+            self.load_protein_excel_button.setEnabled(True)
+
+    def load_protein_excel_file(self):
+        """Load protein sequences from Excel file"""
+        excel_path = self.protein_excel_label.text()
+        if excel_path == "No file selected":
+            QMessageBox.warning(self, "Error", "Please select a protein Excel file first.")
+            return
+        
+        try:
+            # Get column indices
+            name_col = self.protein_name_column_combo.currentIndex()
+            seq_col = self.protein_seq_column_combo.currentIndex()
+            
+            # Read Excel file
+            df = pd.read_excel(excel_path)
+            
+            # Extract protein data
+            self.protein_data = []
+            for index, row in df.iterrows():
+                protein_name = str(row.iloc[name_col]).strip() if pd.notna(row.iloc[name_col]) else None
+                protein_seq = str(row.iloc[seq_col]).strip() if pd.notna(row.iloc[seq_col]) else None
+                
+                if protein_name and protein_seq and protein_name.lower() not in ['nan', 'none', '']:
+                    self.protein_data.append({
+                        'name': protein_name,
+                        'sequence': protein_seq,
+                        'length': len(protein_seq.replace(' ', ''))
+                    })
+            
+            # Update UI
+            self.protein_count_label.setText(f"Proteins loaded: {len(self.protein_data)}")
+            self.create_protein_radio_buttons()
+            self.update_batch_submit_button()
+            
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"Successfully loaded {len(self.protein_data)} protein sequences."
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading protein Excel file:\n{str(e)}")
+
+    def create_protein_radio_buttons(self):
+        """Create radio buttons for protein selection"""
+        # Clear existing radio buttons
+        for button in self.protein_radio_group.buttons():
+            self.protein_radio_group.removeButton(button)
+            button.deleteLater()
+        
+        # Clear layout
+        while self.protein_radio_layout.count():
+            item = self.protein_radio_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Create new radio buttons
+        for i, protein in enumerate(self.protein_data):
+            radio = QRadioButton(f"{protein['name']} ({protein['length']} AA)")
+            radio.setProperty("protein_index", i)
+            radio.toggled.connect(self.on_protein_selection_changed)
+            
+            self.protein_radio_layout.addWidget(radio)
+            self.protein_radio_group.addButton(radio)
+            
+            # Select first protein by default
+            if i == 0:
+                radio.setChecked(True)
+                self.selected_protein = protein
+
+    def on_protein_selection_changed(self):
+        """Handle protein selection change"""
+        sender = self.sender()
+        if sender.isChecked():
+            protein_index = sender.property("protein_index")
+            self.selected_protein = self.protein_data[protein_index]
+            
+            # Update preview
+            self.selected_protein_name_label.setText(f"Name: {self.selected_protein['name']}")
+            self.selected_protein_length_label.setText(f"Length: {self.selected_protein['length']} AA")
+            
+            # Show sequence preview (first 100 characters)
+            seq_preview = self.selected_protein['sequence'][:100]
+            if len(self.selected_protein['sequence']) > 100:
+                seq_preview += "..."
+            self.protein_sequence_preview.setText(seq_preview)
+            
+            self.update_batch_submit_button()
+
+    def browse_roi_excel_file(self):
+        """Browse for ROI Excel file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select ROI Excel File", 
+            "", 
+            "Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        
+        if file_path:
+            self.roi_excel_label.setText(file_path)
+            self.load_roi_data()
+
+    def load_roi_data(self):
+        """Load ROI data from Excel file"""
+        excel_path = self.roi_excel_label.text()
+        if excel_path == "No ROI file selected":
+            return
+        
+        try:
+            # Read Excel file
+            df = pd.read_excel(excel_path, sheet_name='ROI_Analysis')
+            
+            # Filter rows where found_roi is True
+            roi_df = df[df['found_roi'] == True].copy()
+            
+            # Extract ROI data
+            self.roi_data = []
+            for _, row in roi_df.iterrows():
+                if pd.notna(row['gene']) and pd.notna(row['gene_name']) and pd.notna(row['roi_locus']):
+                    self.roi_data.append({
+                        'gene_name': str(row['gene_name']),
+                        'roi_sequence': str(row['gene']),
+                        'roi_locus': str(row['roi_locus']),
+                        'accession': str(row.get('accession_number', 'Unknown'))
+                    })
+            
+            # Update UI
+            self.roi_count_label.setText(f"ROI sequences loaded: {len(self.roi_data)}")
+            self.update_batch_submit_button()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading ROI data:\n{str(e)}")
+
+    # Updated the existing update_batch_submit_button method to also enable export button
+    def update_batch_submit_button(self):
+        """Updated the batch submit button state (modified to include login check)"""
+        has_protein = self.selected_protein is not None
+        has_roi = len(self.roi_data) > 0
+        is_logged_in = self.is_logged_in  # NEW: Check login status
+        
+        can_submit = has_protein and has_roi and is_logged_in
+        self.start_batch_button.setEnabled(can_submit)
+        
+        # Enable export button if we have protein and ROI data
+        can_export = has_protein and has_roi
+        self.export_plan_button.setEnabled(can_export)
+        
+        # Update job count and prepare batch jobs for export
+        if has_protein and has_roi:
+            try:
+                selected_protein_index = self.protein_data.index(self.selected_protein)
+                job_limit = self.job_limit_input.value()
+                from protein_roi_loader import create_job_batch
+                self.batch_jobs, _ = create_job_batch(
+                    self.protein_data, 
+                    self.roi_data, 
+                    selected_protein_index, 
+                    job_limit
+                )
+                total_jobs = len(self.batch_jobs)
+                self.total_jobs_label.setText(f"Total jobs to submit: {total_jobs}")
+            except Exception:
+                self.total_jobs_label.setText("Total jobs to submit: 0")
+        else:
+            self.total_jobs_label.setText("Total jobs to submit: 0")
+            self.batch_jobs = []
+        
+        # Update status message based on what's missing
+        if not is_logged_in:
+            self.batch_status_label.setText("Please login to AlphaFold 3 first")
+        elif not has_protein:
+            self.batch_status_label.setText("Please select a protein sequence")
+        elif not has_roi:
+            self.batch_status_label.setText("Please load ROI data")
+        else:
+            self.batch_status_label.setText("Ready for batch submission")
+
+    def start_batch_submission(self):
+        """Start the batch submission process"""
+        if not self.selected_protein or not self.roi_data:
+            QMessageBox.warning(self, "Error", "Please select a protein and load ROI data first.")
+            return
+        
+        # Prepare batch jobs
+        self.prepare_batch_jobs()
+        
+        # Check job limit
+        job_limit = self.job_limit_input.value()
+        if len(self.batch_jobs) > job_limit:
+            reply = QMessageBox.question(
+                self,
+                "Job Limit Warning",
+                f"You have {len(self.batch_jobs)} jobs to submit but your daily limit is {job_limit}.\n"
+                f"Do you want to submit only the first {job_limit} jobs?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.batch_jobs = self.batch_jobs[:job_limit]
+            else:
+                return
+        
+        # Start batch submission
+        self.current_job_index = 0
+        self.start_batch_button.setEnabled(False)
+        self.stop_batch_button.setEnabled(True)
+        
+        # Start the batch thread
+        from alphafold_batch_handler import AlphaFoldBatchHandler
+        
+        self.batch_handler = AlphaFoldBatchHandler(
+            self.alphafold_email.text().strip(),
+            self.alphafold_password.text().strip()
+        )
+        
+        # Connect signals and start
+        self.batch_handler.job_completed.connect(self.on_job_completed)
+        self.batch_handler.job_failed.connect(self.on_job_failed)
+        self.batch_handler.batch_completed.connect(self.on_batch_completed)
+        self.batch_handler.progress_update.connect(self.on_batch_progress)
+        
+        self.batch_handler.start_batch(self.batch_jobs)
+        
+        self.batch_log.append(f"Started batch submission of {len(self.batch_jobs)} jobs")
+
+    def prepare_batch_jobs(self):
+        """Prepare the list of jobs for batch submission"""
+        self.batch_jobs = []
+        
+        for roi in self.roi_data:
+            # Generate job name
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+            
+            job_name = f"Protein-DNA_{self.selected_protein['name']}_{roi['gene_name']}_{roi['roi_locus']}_{timestamp}"
+            
+            job = {
+                'job_name': job_name,
+                'protein_name': self.selected_protein['name'],
+                'protein_sequence': self.selected_protein['sequence'],
+                'dna_sequence': roi['roi_sequence'],
+                'gene_name': roi['gene_name'],
+                'roi_locus': roi['roi_locus'],
+                'accession': roi['accession']
+            }
+            
+            self.batch_jobs.append(job)
+
+    def stop_batch_submission(self):
+        """Stop the batch submission process"""
+        if self.batch_handler:
+            self.batch_handler.stop_batch()
+        
+        self.start_batch_button.setEnabled(True)
+        self.stop_batch_button.setEnabled(False)
+        self.resume_batch_button.setEnabled(True)
+        
+        self.batch_log.append("Batch submission stopped by user")
+
+    def resume_batch_submission(self):
+        """Resume the batch submission process"""
+        if self.batch_handler and self.current_job_index < len(self.batch_jobs):
+            remaining_jobs = self.batch_jobs[self.current_job_index:]
+            self.batch_handler.start_batch(remaining_jobs)
+            
+            self.start_batch_button.setEnabled(False)
+            self.stop_batch_button.setEnabled(True)
+            self.resume_batch_button.setEnabled(False)
+            
+            self.batch_log.append(f"Resumed batch submission with {len(remaining_jobs)} remaining jobs")
+
+    def on_job_completed(self, job_info, job_id, results_path):
+        """Handle individual job completion"""
+        self.current_job_index += 1
+        self.jobs_completed_label.setText(f"Jobs completed: {self.current_job_index}")
+        
+        progress = int((self.current_job_index / len(self.batch_jobs)) * 100)
+        self.batch_progress_bar.setValue(progress)
+        
+        self.current_job_label.setText(f"Completed: {job_info['job_name']}")
+        self.batch_log.append(f"✓ Completed: {job_info['job_name']} (ID: {job_id})")
+
+    def on_job_failed(self, job_info, error_message):
+        """Handle individual job failure"""
+        self.current_job_index += 1
+        self.jobs_completed_label.setText(f"Jobs completed: {self.current_job_index}")
+        
+        progress = int((self.current_job_index / len(self.batch_jobs)) * 100)
+        self.batch_progress_bar.setValue(progress)
+        
+        self.current_job_label.setText(f"Failed: {job_info['job_name']}")
+        self.batch_log.append(f"✗ Failed: {job_info['job_name']} - {error_message}")
+
+    def on_batch_completed(self, summary):
+        """Handle batch completion"""
+        self.start_batch_button.setEnabled(True)
+        self.stop_batch_button.setEnabled(False)
+        self.resume_batch_button.setEnabled(False)
+        
+        self.batch_status_label.setText("Batch completed!")
+        self.current_job_label.setText("All jobs processed")
+        
+        successful = summary.get('successful', 0)
+        failed = summary.get('failed', 0)
+        total = summary.get('total', 0)
+        
+        self.batch_log.append("="*50)
+        self.batch_log.append(f"BATCH COMPLETED!")
+        self.batch_log.append(f"Total jobs: {total}")
+        self.batch_log.append(f"Successful: {successful}")
+        self.batch_log.append(f"Failed: {failed}")
+        self.batch_log.append(f"Success rate: {(successful/total*100):.1f}%" if total > 0 else "0%")
+        self.batch_log.append(f"Results directory: {summary.get('output_directory', 'Unknown')}")
+        self.batch_log.append("="*50)
+        
+        # Show completion dialog
+        QMessageBox.information(
+            self,
+            "Batch Complete",
+            f"Batch submission completed!\n\n"
+            f"Protein: {self.selected_protein['name']}\n"
+            f"Total jobs: {total}\n"
+            f"Successful: {successful}\n"
+            f"Failed: {failed}\n"
+            f"Success rate: {(successful/total*100):.1f}%" if total > 0 else "0%\n\n"
+            f"Results saved to:\n{summary.get('output_directory', 'Unknown')}\n\n"
+            f"Check the batch log for detailed information about each job."
+        )
+
+    def on_batch_progress(self, message):
+        """Handle batch progress updates"""
+        self.batch_status_label.setText(message)
+        self.batch_log.append(f"[INFO] {message}")
+    ############### Latest Code 
+    def on_job_limit_reached(self, message):
+        """Handle job limit reached signal"""
+        self.batch_log.append(f"[WARNING] {message}")
+        QMessageBox.warning(self, "Job Limit Reached", message)
+
+    def export_job_plan(self):
+        """Export the current job plan to Excel for review"""
+        if not self.batch_jobs:
+            QMessageBox.warning(self, "No Jobs", "No jobs have been prepared yet. Please select a protein and load ROI data first.")
+            return
+        
+        try:
+            # Get save path
+            default_name = f"job_plan_{self.selected_protein['name']}_{len(self.batch_jobs)}_jobs.xlsx"
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Job Plan",
+                default_name,
+                "Excel Files (*.xlsx);;All Files (*)"
+            )
+            
+            if not file_path:
+                return
+            
+            # Export job plan
+            from protein_roi_loader import DataExporter
+            DataExporter.export_job_plan(self.batch_jobs, file_path)
+            
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Job plan exported successfully to:\n{file_path}\n\n"
+                f"The file contains detailed information about all {len(self.batch_jobs)} planned jobs."
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Error exporting job plan:\n{str(e)}")
+
+    def validate_current_setup(self):
+        """Validate the current protein and ROI setup before submission"""
+        validation_messages = []
+        
+        # Check protein selection
+        if not self.selected_protein:
+            validation_messages.append("❌ No protein selected")
+        else:
+            validation_messages.append(f"✓ Protein: {self.selected_protein['name']} ({self.selected_protein['length']} AA)")
+            if self.selected_protein.get('warnings'):
+                validation_messages.append(f"  ⚠️ Warnings: {len(self.selected_protein['warnings'])}")
+        
+        # Check ROI data
+        if not self.roi_data:
+            validation_messages.append("❌ No ROI data loaded")
+        else:
+            validation_messages.append(f"✓ ROI sequences: {len(self.roi_data)}")
+            valid_rois = [roi for roi in self.roi_data if roi.get('is_valid', True)]
+            if len(valid_rois) != len(self.roi_data):
+                validation_messages.append(f"  ⚠️ {len(self.roi_data) - len(valid_rois)} ROI sequences have warnings")
+        
+        # Check credentials
+        has_email = self.alphafold_email.text().strip() != ""
+        has_password = self.alphafold_password.text().strip() != ""
+        
+        if has_email and has_password:
+            validation_messages.append("✓ AlphaFold credentials provided")
+        else:
+            validation_messages.append("❌ AlphaFold credentials missing")
+        
+        # Calculate job estimates
+        if self.selected_protein and self.roi_data:
+            total_jobs = len(self.roi_data)
+            job_limit = self.job_limit_input.value()
+            
+            validation_messages.append(f"📊 Total jobs planned: {total_jobs}")
+            validation_messages.append(f"📊 Daily job limit: {job_limit}")
+            
+            if total_jobs > job_limit:
+                validation_messages.append(f"⚠️ Jobs exceed daily limit by {total_jobs - job_limit}")
+            
+            # Estimate processing time
+            complexity_counts = {'Low': 0, 'Medium': 0, 'High': 0}
+            if hasattr(self, 'batch_jobs') and self.batch_jobs:
+                for job in self.batch_jobs:
+                    complexity_counts[job.get('estimated_complexity', 'Medium')] += 1
+            
+            estimated_hours = (complexity_counts['Low'] * 0.5 + 
+                            complexity_counts['Medium'] * 1.0 + 
+                            complexity_counts['High'] * 2.0)
+            validation_messages.append(f"⏱️ Estimated processing time: {estimated_hours:.1f} hours")
+        
+        # Show validation dialog
+        validation_text = "\n".join(validation_messages)
+        QMessageBox.information(self, "Setup Validation", validation_text)
+
+    def export_protein_summary(self):
+        """Export protein summary to Excel"""
+        if not self.protein_data:
+            QMessageBox.warning(self, "No Data", "No protein data to export.")
+            return
+        
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"protein_summary_{timestamp}.xlsx"
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Protein Summary",
+                default_name,
+                "Excel Files (*.xlsx);;All Files (*)"
+            )
+            
+            if file_path:
+                from protein_roi_loader import DataExporter
+                DataExporter.export_protein_summary(self.protein_data, file_path)
+                
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"Protein summary exported to:\n{file_path}"
+                )
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Error exporting protein summary:\n{str(e)}")
+
+    
+    def save_batch_log(self):
+        """Save the batch log to a file"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"alphafold_batch_log_{timestamp}.txt"
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Batch Log",
+                default_name,
+                "Text Files (*.txt);;All Files (*)"
+            )
+            
+            if file_path:
+                with open(file_path, 'w') as f:
+                    f.write(f"AlphaFold Batch Processing Log\n")
+                    f.write(f"Generated: {datetime.now().isoformat()}\n")
+                    f.write("="*60 + "\n\n")
+                    f.write(self.batch_log.toPlainText())
+                
+                QMessageBox.information(self, "Log Saved", f"Batch log saved to:\n{file_path}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error saving log file:\n{str(e)}")
+    
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Log in Code~~~~~~~~~~~~~
+    def check_existing_cookies(self):
+        """Check if AlphaFold cookies already exist"""
+        import os
+        cookies_file = "alphafold_cookies.pkl"
+        
+        if os.path.exists(cookies_file):
+            self.auto_login_button.setEnabled(True)
+            self.login_status_label.setText("Status: Cookies found - ready for auto login")
+            self.login_status_label.setStyleSheet("color: orange; font-weight: bold;")
+            self.batch_log.append("Found existing AlphaFold cookies")
+        else:
+            self.auto_login_button.setEnabled(False)
+            self.login_status_label.setText("Status: Not logged in - manual login required")
+            self.login_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+    def perform_manual_login(self):
+        """Perform manual login to AlphaFold and save cookies"""
+        try:
+            from alphafold_login import AlphaFoldLogin
+            
+            # Create login handler
+            self.alphafold_login_handler = AlphaFoldLogin()
+            
+            # Update UI
+            self.manual_login_button.setEnabled(False)
+            self.manual_login_button.setText("Opening browser...")
+            self.login_status_label.setText("Status: Browser opened - complete login manually")
+            self.login_status_label.setStyleSheet("color: blue; font-weight: bold;")
+            
+            self.batch_log.append("Starting manual login process...")
+            self.batch_log.append("Browser will open - please complete Google login manually")
+            
+            # Start manual login process
+            success = self.alphafold_login_handler.manual_login()
+            
+            if success:
+                self.login_status_label.setText("Status: Successfully logged in and cookies saved")
+                self.login_status_label.setStyleSheet("color: green; font-weight: bold;")
+                self.is_logged_in = True
+                
+                # Enable relevant buttons
+                self.auto_login_button.setEnabled(True)
+                self.validate_setup_button.setEnabled(True)
+                self.update_batch_submit_button()
+                
+                self.batch_log.append("✓ Manual login successful - cookies saved")
+                self.batch_log.append("You can now use 'Login with Saved Cookies' for future sessions")
+                
+                QMessageBox.information(
+                    self,
+                    "Login Successful",
+                    "Successfully logged in to AlphaFold 3!\n\n"
+                    "Your login cookies have been saved.\n"
+                    "You can now proceed with batch job submission.\n\n"
+                    "For future sessions, you can use 'Login with Saved Cookies'."
+                )
+                
+            else:
+                self.login_status_label.setText("Status: Manual login failed")
+                self.login_status_label.setStyleSheet("color: red; font-weight: bold;")
+                self.batch_log.append("✗ Manual login failed")
+                
+                QMessageBox.warning(
+                    self,
+                    "Login Failed",
+                    "Manual login to AlphaFold 3 failed.\n\n"
+                    "Please check your internet connection and try again.\n"
+                    "Make sure to complete the Google login process in the browser."
+                )
+                
+        except Exception as e:
+            self.login_status_label.setText("Status: Login error occurred")
+            self.login_status_label.setStyleSheet("color: red; font-weight: bold;")
+            self.batch_log.append(f"✗ Login error: {str(e)}")
+            
+            QMessageBox.critical(
+                self,
+                "Login Error",
+                f"An error occurred during login:\n\n{str(e)}\n\n"
+                "Please try again or check the console for more details."
+            )
+            
+        finally:
+            # Reset button state
+            self.manual_login_button.setEnabled(True)
+            self.manual_login_button.setText("Manual Login & Save Cookies")
+
+    def perform_auto_login(self):
+        """Perform automatic login using saved cookies"""
+        try:
+            from alphafold_login import AlphaFoldLogin
+            
+            # Create login handler
+            self.alphafold_login_handler = AlphaFoldLogin()
+            
+            # Update UI
+            self.auto_login_button.setEnabled(False)
+            self.auto_login_button.setText("Logging in...")
+            self.login_status_label.setText("Status: Attempting auto login...")
+            self.login_status_label.setStyleSheet("color: blue; font-weight: bold;")
+            
+            self.batch_log.append("Attempting automatic login with saved cookies...")
+            
+            # Attempt cookie-based login
+            success = self.alphafold_login_handler.login_with_cookies()
+            
+            if success:
+                self.login_status_label.setText("Status: Successfully logged in with cookies")
+                self.login_status_label.setStyleSheet("color: green; font-weight: bold;")
+                self.is_logged_in = True
+                
+                # Enable relevant buttons
+                self.validate_setup_button.setEnabled(True)
+                self.update_batch_submit_button()
+                
+                self.batch_log.append("✓ Automatic login successful")
+                
+                QMessageBox.information(
+                    self,
+                    "Login Successful",
+                    "Successfully logged in to AlphaFold 3 using saved cookies!\n\n"
+                    "You can now proceed with batch job submission."
+                )
+                
+            else:
+                self.login_status_label.setText("Status: Auto login failed - cookies may be expired")
+                self.login_status_label.setStyleSheet("color: orange; font-weight: bold;")
+                self.batch_log.append("✗ Automatic login failed - cookies may be expired")
+                
+                # Ask user if they want to do manual login
+                reply = QMessageBox.question(
+                    self,
+                    "Auto Login Failed",
+                    "Automatic login failed. This usually means your saved cookies have expired.\n\n"
+                    "Would you like to perform a manual login to refresh your cookies?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.perform_manual_login()
+                    return
+                
+        except Exception as e:
+            self.login_status_label.setText("Status: Auto login error occurred")
+            self.login_status_label.setStyleSheet("color: red; font-weight: bold;")
+            self.batch_log.append(f"✗ Auto login error: {str(e)}")
+            
+            QMessageBox.critical(
+                self,
+                "Auto Login Error",
+                f"An error occurred during automatic login:\n\n{str(e)}\n\n"
+                "Try performing a manual login instead."
+            )
+            
+        finally:
+            # Reset button state
+            self.auto_login_button.setEnabled(True)
+            self.auto_login_button.setText("Login with Saved Cookies")
+
+    def check_login_status(self):
+        """Check current login status"""
+        try:
+            if not self.alphafold_login_handler:
+                self.batch_log.append("No active login session")
+                QMessageBox.information(self, "Login Status", "No active login session found.")
+                return
+            
+            # Update UI
+            self.check_login_button.setEnabled(False)
+            self.check_login_button.setText("Checking...")
+            self.batch_log.append("Checking login status...")
+            
+            # Here you could add additional checks by trying to access AlphaFold pages
+            # For now, we'll just check if we have a login handler and cookies exist
+            import os
+            cookies_exist = os.path.exists("alphafold_cookies.pkl")
+            
+            if self.is_logged_in and cookies_exist:
+                status_msg = "✓ Logged in with valid session"
+                self.batch_log.append(status_msg)
+                QMessageBox.information(self, "Login Status", "Currently logged in to AlphaFold 3.")
+            else:
+                status_msg = "✗ Not logged in or session expired"
+                self.batch_log.append(status_msg)
+                QMessageBox.warning(self, "Login Status", "Not currently logged in to AlphaFold 3.")
+                
+        except Exception as e:
+            self.batch_log.append(f"Error checking login status: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error checking login status:\n{str(e)}")
+            
+        finally:
+            # Reset button state
+            self.check_login_button.setEnabled(True)
+            self.check_login_button.setText("Check Login Status")
+        
+        
