@@ -1472,8 +1472,9 @@ class MainWindow(QMainWindow):
             f"An error occurred during bulk preprocessing:\n\n{error_message}"
         )
 
+    # 2. FIXED export_preprocessing_results function in ncbi_alphafold_gui_r.py
     def export_preprocessing_results(self):
-        """Export the full preprocessing results to Excel"""
+        """Export the full preprocessing results to Excel (append to existing file)"""
         if self.preprocessing_results_df is None:
             QMessageBox.warning(self, "Error", "No results to export. Please process files first.")
             return
@@ -1494,41 +1495,80 @@ class MainWindow(QMainWindow):
                 return
         
         try:
+            # Check if file already exists
+            existing_df = None
+            if os.path.exists(output_path):
+                try:
+                    # Read existing data from ROI_Analysis sheet
+                    existing_df = pd.read_excel(output_path, sheet_name='ROI_Analysis')
+                    print(f"Found existing file with {len(existing_df)} rows")
+                except Exception as e:
+                    print(f"Could not read existing file: {e}")
+                    existing_df = None
+            
+            # Prepare final dataframe
+            if existing_df is not None and not existing_df.empty:
+                # Append new results to the top of existing data
+                final_df = pd.concat([self.preprocessing_results_df, existing_df], ignore_index=True)
+                print(f"Appending {len(self.preprocessing_results_df)} new rows to {len(existing_df)} existing rows")
+            else:
+                # No existing data, use new results only
+                final_df = self.preprocessing_results_df
+                print(f"Creating new file with {len(final_df)} rows")
+            
             # Save to Excel with additional summary sheet
             with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                # Main results
-                self.preprocessing_results_df.to_excel(writer, sheet_name='ROI_Analysis', index=False)
+                # Main results (with appended data)
+                final_df.to_excel(writer, sheet_name='ROI_Analysis', index=False)
                 
-                # Summary statistics
+                # Summary statistics (for all data including existing)
+                total_files = len(final_df['gene_name'].unique())
+                total_roi_found = len(final_df[final_df['found_roi'] == True])
+                files_with_roi = len(final_df[final_df['found_roi'] == True]['gene_name'].unique())
+                files_without_roi = len(final_df[final_df['found_roi'] == False]['gene_name'].unique())
+                
+                # Calculate average ROI per file safely
+                avg_roi_per_file = 0
+                if total_files > 0:
+                    avg_roi_per_file = round(total_roi_found / total_files, 2)
+                
                 summary_stats = {
                     'Metric': [
                         'Total Files Processed',
                         'Total ROI Sequences Found',
                         'Files with ROI Found',
                         'Files without ROI',
-                        'Average ROI per File'
+                        'Average ROI per File',
+                        'Last Processing Date'
                     ],
                     'Value': [
-                        len(self.preprocessing_results_df['gene_name'].unique()),
-                        len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == True]),
-                        len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == True]['gene_name'].unique()),
-                        len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == False]['gene_name'].unique()),
-                        round(len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == True]) / 
-                            len(self.preprocessing_results_df['gene_name'].unique()), 2)
+                        total_files,
+                        total_roi_found,
+                        files_with_roi,
+                        files_without_roi,
+                        avg_roi_per_file,
+                        pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
                     ]
                 }
                 summary_df = pd.DataFrame(summary_stats)
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
             
             # Show success message
-            QMessageBox.information(
-                self,
-                "Export Complete",
-                f"Results successfully exported to:\n{output_path}\n\n"
-                f"The file contains two sheets:\n"
-                f"- 'ROI_Analysis': Detailed results\n"
-                f"- 'Summary': Statistics overview"
-            )
+            if existing_df is not None and not existing_df.empty:
+                message = (f"Results successfully appended to existing file:\n{output_path}\n\n"
+                        f"New entries added: {len(self.preprocessing_results_df)}\n"
+                        f"Total entries now: {len(final_df)}\n\n"
+                        f"The file contains two sheets:\n"
+                        f"- 'ROI_Analysis': All results (new + existing)\n"
+                        f"- 'Summary': Updated statistics overview")
+            else:
+                message = (f"Results successfully exported to:\n{output_path}\n\n"
+                        f"Total entries: {len(final_df)}\n\n"
+                        f"The file contains two sheets:\n"
+                        f"- 'ROI_Analysis': Detailed results\n"
+                        f"- 'Summary': Statistics overview")
+            
+            QMessageBox.information(self, "Export Complete", message)
             
             # Update the label to show the actual saved path
             self.excel_output_label.setText(output_path)

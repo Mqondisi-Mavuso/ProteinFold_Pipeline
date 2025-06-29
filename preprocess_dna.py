@@ -70,7 +70,7 @@ class SequenceProcessor:
             # Extract the sequence with context
             roi_with_context = sequence[context_start:context_end]
             
-            # Create locus string (start_end format)
+            # Create locus string (start_end format) - use actual positions in original sequence
             roi_locus = f"{context_start}_{context_end-1}"
             
             roi_info = {
@@ -106,7 +106,7 @@ class SequenceProcessor:
         """Parse FASTA filename to extract accession number and gene name
         
         Args:
-            filename (str): FASTA filename (e.g., "NM_001315501.2_full_SLC22A18.fasta")
+            filename (str): FASTA filename (e.g., "NM_023112.4_full_SLC22A18.fasta")
             
         Returns:
             Tuple[str, str]: (accession_number, gene_name)
@@ -114,23 +114,51 @@ class SequenceProcessor:
         # Remove file extension
         base_name = Path(filename).stem
         
-        # Split by underscore and extract parts
-        parts = base_name.split('_')
+        # Pattern to match: accession_number + optional_descriptor + gene_name
+        # Examples: "NM_023112.4_full_SLC22A18" or "XM_054320700.1_2100bp_NWD1"
         
-        if len(parts) >= 3:
-            # Format: accession_full_genename or accession_length_genename
-            accession = parts[0]
-            gene_name = '_'.join(parts[2:])  # In case gene name has underscores
-        else:
-            # Fallback: try to find pattern
-            match = re.match(r'^([^_]+)_.*?([A-Za-z0-9]+)$', base_name)
-            if match:
-                accession = match.group(1)
-                gene_name = match.group(2)
+        # First, try to identify accession pattern (starts with letters, has underscore and numbers/dots)
+        accession_match = re.match(r'^([A-Z]{1,3}_[0-9]+(?:\.[0-9]+)?)_', base_name)
+        
+        if accession_match:
+            accession = accession_match.group(1)
+            # Remove the accession and the following underscore to get the rest
+            remaining = base_name[len(accession) + 1:]
+            
+            # Split the remaining part and get the last part as gene name
+            parts = remaining.split('_')
+            if len(parts) >= 2:
+                # Skip the descriptor (like "full", "2100bp") and get the gene name
+                gene_name = '_'.join(parts[1:])  # In case gene name has underscores
+            elif len(parts) == 1:
+                gene_name = parts[0]
             else:
+                gene_name = remaining
+        else:
+            # Fallback: split by underscore and try to identify accession pattern
+            parts = base_name.split('_')
+            
+            if len(parts) >= 3:
+                # Try to reconstruct accession from first two parts if they match pattern
+                potential_accession = f"{parts[0]}_{parts[1]}"
+                if re.match(r'^[A-Z]{1,3}_[0-9]+(?:\.[0-9]+)?$', potential_accession):
+                    accession = potential_accession
+                    gene_name = '_'.join(parts[2:])  # Everything after accession
+                else:
+                    # If pattern doesn't match, use original logic
+                    accession = parts[0]
+                    gene_name = '_'.join(parts[1:])
+            else:
+                # Very simple filename
                 accession = base_name
                 gene_name = base_name
-                
+        
+        # Clean up gene name by removing common descriptors
+        gene_name = re.sub(r'^(full|[0-9]+bp)_?', '', gene_name)
+        
+        if not gene_name:  # If gene_name is empty after cleaning
+            gene_name = accession
+            
         return accession, gene_name
     
     @staticmethod
