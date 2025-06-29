@@ -13,12 +13,30 @@ from ncbi_threads import NCBISearchThread, SequenceDownloadThread
 from ncbi_bulk_threads import BulkDownloadThread, ExcelLoadThread, RetryFailedThread
 from preprocess_dna import SequenceProcessor
 from alphafold_crawler_2 import AlphaFoldSubmitter
+import pandas as pd
+from pathlib import Path
+from ncbi_bulk_threads import BulkPreprocessingThread
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NCBI Sequence Retriever & AlphaFold Submitter")
         self.setMinimumSize(1400, 800)
+
+        self.preprocessing_thread = None
+        self.preprocessing_results_df = None
+        self.fasta_directory_path = None
+
+        self.fasta_dir_label = None
+        self.bulk_roi_input = None
+        self.excel_output_label = None
+        self.process_directory_button = None
+        self.preprocessing_progress = None
+        self.preprocessing_status = None
+        self.files_processed_label = None
+        self.roi_found_label = None
+        self.results_table = None
+        self.export_results_button = None
         
         # Store search results
         self.search_results = []
@@ -551,7 +569,7 @@ class MainWindow(QMainWindow):
         self.find_roi()
     
     def create_alphafold_tab(self):
-        """Create the AlphaFold tab (unchanged from original)"""
+        """Create the AlphaFold tab with updated preprocessing functionality"""
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         
@@ -564,11 +582,19 @@ class MainWindow(QMainWindow):
         tab_widget = QTabWidget()
         right_layout.addWidget(tab_widget)
         
-        # Tab 1: Sequence Pre-processor
+        # Tab 1: Sequence Pre-processor (UPDATED WITH TABBED INTERFACE)
         preprocessor_tab = QWidget()
         preprocessor_layout = QVBoxLayout(preprocessor_tab)
         
-        # File loading section
+        # Create a tab widget for single vs bulk preprocessing
+        preprocess_tabs = QTabWidget()
+        preprocessor_layout.addWidget(preprocess_tabs)
+        
+        # Single File Processing Tab (existing functionality)
+        single_process_tab = QWidget()
+        single_layout = QVBoxLayout(single_process_tab)
+        
+        # File loading section (existing)
         file_group = QGroupBox("Load FASTA Sequence")
         file_layout = QVBoxLayout()
         
@@ -582,7 +608,7 @@ class MainWindow(QMainWindow):
         file_buttons_layout.addWidget(self.paste_sequence_button)
         file_layout.addLayout(file_buttons_layout)
         
-        # Display loaded file path
+        # Display loaded file path (existing)
         path_layout = QHBoxLayout()
         path_layout.addWidget(QLabel("Current File:"))
         self.file_path_label = QLabel("No file loaded")
@@ -591,16 +617,16 @@ class MainWindow(QMainWindow):
         file_layout.addLayout(path_layout)
         
         file_group.setLayout(file_layout)
-        preprocessor_layout.addWidget(file_group)
+        single_layout.addWidget(file_group)
         
-        # ROI finder section
+        # ROI finder section (existing)
         roi_group = QGroupBox("Region of Interest (ROI) Finder")
         roi_layout = QVBoxLayout()
         
-        # ROI input
+        # ROI input (existing)
         roi_input_layout = QHBoxLayout()
         roi_input_layout.addWidget(QLabel("ROI Pattern:"))
-        self.roi_input = QLineEdit("CACCTGA")  # Default ROI
+        self.roi_input = QLineEdit("CACCTG")  # Updated default ROI
         roi_input_layout.addWidget(self.roi_input)
         self.find_roi_button = QPushButton("Find ROI")
         self.find_roi_button.clicked.connect(self.find_roi)
@@ -608,7 +634,7 @@ class MainWindow(QMainWindow):
         roi_input_layout.addWidget(self.find_roi_button)
         roi_layout.addLayout(roi_input_layout)
         
-        # ROI results
+        # ROI results (existing)
         roi_layout.addWidget(QLabel("Found ROI Sub-Sequence:"))
         self.roi_result = QTextEdit()
         self.roi_result.setReadOnly(True)
@@ -616,9 +642,101 @@ class MainWindow(QMainWindow):
         roi_layout.addWidget(self.roi_result)
         
         roi_group.setLayout(roi_layout)
-        preprocessor_layout.addWidget(roi_group)
+        single_layout.addWidget(roi_group)
         
-        # Protein sequence section
+        preprocess_tabs.addTab(single_process_tab, "Single File")
+        
+        # Bulk Processing Tab (NEW)
+        bulk_process_tab = QWidget()
+        bulk_layout = QVBoxLayout(bulk_process_tab)
+        
+        # Directory selection
+        dir_group = QGroupBox("Select FASTA Directory")
+        dir_layout = QVBoxLayout()
+        
+        dir_select_layout = QHBoxLayout()
+        self.fasta_dir_label = QLabel("No directory selected")
+        self.browse_fasta_dir_button = QPushButton("Browse Directory")
+        self.browse_fasta_dir_button.clicked.connect(self.browse_fasta_directory)
+        dir_select_layout.addWidget(QLabel("FASTA Directory:"))
+        dir_select_layout.addWidget(self.fasta_dir_label)
+        dir_select_layout.addWidget(self.browse_fasta_dir_button)
+        dir_layout.addLayout(dir_select_layout)
+        
+        # ROI pattern for bulk processing
+        bulk_roi_layout = QHBoxLayout()
+        bulk_roi_layout.addWidget(QLabel("ROI Pattern:"))
+        self.bulk_roi_input = QLineEdit("CACCTG")
+        bulk_roi_layout.addWidget(self.bulk_roi_input)
+        bulk_roi_layout.addStretch()
+        dir_layout.addLayout(bulk_roi_layout)
+        
+        # Output file selection
+        output_layout = QHBoxLayout()
+        self.excel_output_label = QLabel("roi_analysis_summary.xlsx")
+        self.browse_excel_output_button = QPushButton("Browse Output")
+        self.browse_excel_output_button.clicked.connect(self.browse_excel_output)
+        output_layout.addWidget(QLabel("Output Excel:"))
+        output_layout.addWidget(self.excel_output_label)
+        output_layout.addWidget(self.browse_excel_output_button)
+        dir_layout.addLayout(output_layout)
+        
+        dir_group.setLayout(dir_layout)
+        bulk_layout.addWidget(dir_group)
+        
+        # Processing controls
+        control_group = QGroupBox("Processing Controls")
+        control_layout = QVBoxLayout()
+        
+        # Process button
+        self.process_directory_button = QPushButton("Process All FASTA Files")
+        self.process_directory_button.clicked.connect(self.process_fasta_directory)
+        self.process_directory_button.setEnabled(False)
+        self.process_directory_button.setMinimumHeight(40)
+        control_layout.addWidget(self.process_directory_button)
+        
+        # Progress bar
+        self.preprocessing_progress = QProgressBar()
+        control_layout.addWidget(self.preprocessing_progress)
+        
+        # Status label
+        self.preprocessing_status = QLabel("Ready to process FASTA files")
+        control_layout.addWidget(self.preprocessing_status)
+        
+        control_group.setLayout(control_layout)
+        bulk_layout.addWidget(control_group)
+        
+        # Results display
+        results_group = QGroupBox("Processing Results")
+        results_layout = QVBoxLayout()
+        
+        # Summary info
+        summary_layout = QHBoxLayout()
+        self.files_processed_label = QLabel("Files processed: 0")
+        self.roi_found_label = QLabel("ROI sequences found: 0")
+        summary_layout.addWidget(self.files_processed_label)
+        summary_layout.addWidget(self.roi_found_label)
+        summary_layout.addStretch()
+        results_layout.addLayout(summary_layout)
+        
+        # Results table preview
+        results_layout.addWidget(QLabel("Summary Preview (first 10 rows):"))
+        self.results_table = QTableWidget()
+        self.results_table.setMaximumHeight(200)
+        results_layout.addWidget(self.results_table)
+        
+        # Export button
+        self.export_results_button = QPushButton("Export Full Results to Excel")
+        self.export_results_button.clicked.connect(self.export_preprocessing_results)
+        self.export_results_button.setEnabled(False)
+        results_layout.addWidget(self.export_results_button)
+        
+        results_group.setLayout(results_layout)
+        bulk_layout.addWidget(results_group)
+        
+        preprocess_tabs.addTab(bulk_process_tab, "Bulk Processing")
+        
+        # Add the remaining existing content (protein sequence section)
         protein_group = QGroupBox("Protein Sequence")
         protein_layout = QVBoxLayout()
         
@@ -738,6 +856,7 @@ class MainWindow(QMainWindow):
         
         return right_widget
 
+
     def load_fasta_file(self):
         """Load a FASTA file through file dialog"""
         file_path, _ = QFileDialog.getOpenFileName(self, "Open FASTA File", "", "FASTA Files (*.fasta *.fa);;All Files (*)")
@@ -746,7 +865,7 @@ class MainWindow(QMainWindow):
             self.current_fasta_path = file_path
             self.file_path_label.setText(file_path)
             self.find_roi_button.setEnabled(True)
-    
+
     def paste_sequence(self):
         """Open a dialog to paste a sequence"""
         dialog = QMessageBox(self)
@@ -992,6 +1111,24 @@ class MainWindow(QMainWindow):
             self.progress_bar.setVisible(False)
 
     # BULK DOWNLOAD METHODS
+
+    def browse_fasta_directory(self):
+        """Browse for directory containing FASTA files"""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory with FASTA Files",
+            "",
+            QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if directory:
+            self.fasta_directory_path = directory
+            self.fasta_dir_label.setText(directory)
+            self.process_directory_button.setEnabled(True)
+            
+            # Count FASTA files in directory
+            fasta_files = list(Path(directory).glob("*.fasta")) + list(Path(directory).glob("*.fa"))
+            self.preprocessing_status.setText(f"Found {len(fasta_files)} FASTA files in directory")
     
     def browse_excel_file(self):
         """Browse for Excel file"""
@@ -1225,3 +1362,180 @@ class MainWindow(QMainWindow):
         
         # Show error dialog
         QMessageBox.critical(self, "Bulk Download Error", error_message)
+
+    def browse_excel_output(self):
+        """Browse for Excel output file location"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Excel Output As",
+            "roi_analysis_summary.xlsx",
+            "Excel Files (*.xlsx);;All Files (*)"
+        )
+        
+        if file_path:
+            self.excel_output_label.setText(file_path)
+
+    def process_fasta_directory(self):
+        """Start processing all FASTA files in the selected directory"""
+        if not self.fasta_directory_path:
+            QMessageBox.warning(self, "Error", "Please select a directory first.")
+            return
+        
+        roi_pattern = self.bulk_roi_input.text().strip()
+        if not roi_pattern:
+            QMessageBox.warning(self, "Error", "Please enter a ROI pattern.")
+            return
+        
+        # Start processing thread
+        self.preprocessing_thread = BulkPreprocessingThread(
+            self.fasta_directory_path,
+            roi_pattern
+        )
+        
+        self.preprocessing_thread.progress_signal.connect(self.update_preprocessing_progress)
+        self.preprocessing_thread.finished_signal.connect(self.on_preprocessing_finished)
+        self.preprocessing_thread.error_signal.connect(self.handle_preprocessing_error)
+        self.preprocessing_thread.start()
+        
+        # Update UI
+        self.process_directory_button.setText("Processing...")
+        self.process_directory_button.setEnabled(False)
+        self.preprocessing_status.setText("Starting bulk processing...")
+
+    def update_preprocessing_progress(self, current, total, message):
+        """Update preprocessing progress"""
+        self.preprocessing_progress.setMaximum(total)
+        self.preprocessing_progress.setValue(current)
+        self.preprocessing_status.setText(message)
+        self.files_processed_label.setText(f"Files processed: {current}")
+
+    def on_preprocessing_finished(self, results_df):
+        """Handle completion of bulk preprocessing"""
+        self.preprocessing_results_df = results_df
+        
+        # Update UI
+        self.process_directory_button.setText("Process All FASTA Files")
+        self.process_directory_button.setEnabled(True)
+        self.export_results_button.setEnabled(True)
+        
+        # Update summary statistics
+        total_files = len(results_df['gene_name'].unique())
+        total_roi_found = len(results_df[results_df['found_roi'] == True])
+        
+        self.files_processed_label.setText(f"Files processed: {total_files}")
+        self.roi_found_label.setText(f"ROI sequences found: {total_roi_found}")
+        self.preprocessing_status.setText(f"Processing complete! {total_roi_found} ROI sequences found in {total_files} files")
+        
+        # Display preview in table
+        self.display_results_preview(results_df)
+        
+        # Show completion message
+        QMessageBox.information(
+            self,
+            "Processing Complete",
+            f"Bulk processing completed successfully!\n\n"
+            f"Files processed: {total_files}\n"
+            f"ROI sequences found: {total_roi_found}\n\n"
+            f"Click 'Export Full Results to Excel' to save the complete analysis."
+        )
+
+    def display_results_preview(self, df):
+        """Display preview of results in the table widget"""
+        # Show first 10 rows
+        preview_df = df.head(10)
+        
+        # Set up table
+        self.results_table.setRowCount(len(preview_df))
+        self.results_table.setColumnCount(len(preview_df.columns))
+        self.results_table.setHorizontalHeaderLabels(list(preview_df.columns))
+        
+        # Populate table
+        for row_idx, (_, row) in enumerate(preview_df.iterrows()):
+            for col_idx, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                self.results_table.setItem(row_idx, col_idx, item)
+        
+        # Adjust column widths
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+
+    def handle_preprocessing_error(self, error_message):
+        """Handle preprocessing errors"""
+        # Reset UI
+        self.process_directory_button.setText("Process All FASTA Files")
+        self.process_directory_button.setEnabled(True)
+        self.preprocessing_status.setText("Error occurred during processing")
+        
+        # Show error dialog
+        QMessageBox.critical(
+            self,
+            "Preprocessing Error",
+            f"An error occurred during bulk preprocessing:\n\n{error_message}"
+        )
+
+    def export_preprocessing_results(self):
+        """Export the full preprocessing results to Excel"""
+        if self.preprocessing_results_df is None:
+            QMessageBox.warning(self, "Error", "No results to export. Please process files first.")
+            return
+        
+        # Get output file path
+        output_path = self.excel_output_label.text()
+        
+        # If it's still the default name, ask user to choose location
+        if output_path == "roi_analysis_summary.xlsx":
+            output_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Results As",
+                "roi_analysis_summary.xlsx",
+                "Excel Files (*.xlsx);;All Files (*)"
+            )
+            
+            if not output_path:
+                return
+        
+        try:
+            # Save to Excel with additional summary sheet
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # Main results
+                self.preprocessing_results_df.to_excel(writer, sheet_name='ROI_Analysis', index=False)
+                
+                # Summary statistics
+                summary_stats = {
+                    'Metric': [
+                        'Total Files Processed',
+                        'Total ROI Sequences Found',
+                        'Files with ROI Found',
+                        'Files without ROI',
+                        'Average ROI per File'
+                    ],
+                    'Value': [
+                        len(self.preprocessing_results_df['gene_name'].unique()),
+                        len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == True]),
+                        len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == True]['gene_name'].unique()),
+                        len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == False]['gene_name'].unique()),
+                        round(len(self.preprocessing_results_df[self.preprocessing_results_df['found_roi'] == True]) / 
+                            len(self.preprocessing_results_df['gene_name'].unique()), 2)
+                    ]
+                }
+                summary_df = pd.DataFrame(summary_stats)
+                summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Results successfully exported to:\n{output_path}\n\n"
+                f"The file contains two sheets:\n"
+                f"- 'ROI_Analysis': Detailed results\n"
+                f"- 'Summary': Statistics overview"
+            )
+            
+            # Update the label to show the actual saved path
+            self.excel_output_label.setText(output_path)
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Error saving results to Excel:\n\n{str(e)}"
+            )

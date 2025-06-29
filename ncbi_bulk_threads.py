@@ -4,6 +4,8 @@ Thread classes for NCBI bulk operations to avoid blocking the GUI
 import traceback
 from PyQt6.QtCore import QThread, pyqtSignal
 from ncbi_bulk_fetcher import NCBIBulkFetcher
+from preprocess_dna import SequenceProcessor
+import pandas as pd
 
 class BulkDownloadThread(QThread):
     """Thread for handling bulk NCBI downloads without blocking the GUI"""
@@ -136,3 +138,38 @@ class RetryFailedThread(QThread):
         except Exception as e:
             error_msg = f"Retry error: {str(e)}\n{traceback.format_exc()}"
             self.error_signal.emit(error_msg)
+
+class BulkPreprocessingThread(QThread):
+    """Thread for bulk processing FASTA files without blocking the GUI"""
+    progress_signal = pyqtSignal(int, int, str)  # current, total, message
+    finished_signal = pyqtSignal(pd.DataFrame)  # result DataFrame
+    error_signal = pyqtSignal(str)  # error message
+    
+    def __init__(self, directory_path, roi_pattern="CACCTG"):
+        super().__init__()
+        self.directory_path = directory_path
+        self.roi_pattern = roi_pattern
+        self.is_cancelled = False
+    
+    def run(self):
+        try:
+            def progress_callback(current, total, message):
+                if not self.is_cancelled:
+                    self.progress_signal.emit(current, total, message)
+            
+            # Process the directory
+            df = SequenceProcessor.process_fasta_directory(
+                self.directory_path, 
+                self.roi_pattern, 
+                progress_callback
+            )
+            
+            if not self.is_cancelled:
+                self.finished_signal.emit(df)
+                
+        except Exception as e:
+            self.error_signal.emit(f"Error during bulk preprocessing: {str(e)}")
+    
+    def cancel(self):
+        """Cancel the processing"""
+        self.is_cancelled = True
