@@ -1,3 +1,8 @@
 # Folders to be excluded 
 downloaded_sequences/
 __pycache__/
+login_screenshots/
+screenshots/
+upload_screenshots/
+browser_screenshots/
+alphafold_page.html
