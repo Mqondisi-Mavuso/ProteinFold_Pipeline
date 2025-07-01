@@ -204,6 +204,9 @@ class AlphaFoldJobSubmitter:
         try:
             print("Adding protein entity...")
             
+            # Dismiss any overlays first
+            self._dismiss_overlays()
+            
             # Find and click "Add entity" button
             add_entity_button = self._find_add_entity_button()
             if not add_entity_button:
@@ -224,14 +227,40 @@ class AlphaFoldJobSubmitter:
             print("Clicked Add entity button for protein")
             time.sleep(3)  # Wait for entity to be added
             
+            # Dismiss any overlays that might appear after clicking
+            self._dismiss_overlays()
+            
             # Wait for entity to be added and find the dropdown
-            entity_dropdown = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, "//mat-select[contains(@class, 'sequence-type')]"))
-            )
+            entity_dropdown = None
+            dropdown_selectors = [
+                "//mat-select[contains(@class, 'sequence-type')]",
+                "//mat-select[@role='combobox']",
+                "//gdm-af-sequence-entity[1]//mat-select"
+            ]
+            
+            for selector in dropdown_selectors:
+                try:
+                    entity_dropdown = self.wait.until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                    print(f"Found entity dropdown using: {selector}")
+                    break
+                except:
+                    continue
+            
+            if not entity_dropdown:
+                raise Exception("Could not find entity type dropdown")
             
             # Click dropdown to open options
-            entity_dropdown.click()
-            time.sleep(1)
+            try:
+                entity_dropdown.click()
+            except Exception:
+                # If click is intercepted, dismiss overlays and try again
+                self._dismiss_overlays()
+                time.sleep(1)
+                self.driver.execute_script("arguments[0].click();", entity_dropdown)
+            
+            time.sleep(2)
             
             # Select "Protein" option
             protein_option = self.wait.until(
@@ -436,6 +465,37 @@ class AlphaFoldJobSubmitter:
             print(f"Error continuing to preview: {e}")
             return False
     
+    def _dismiss_overlays(self):
+        """Dismiss any overlays that might be blocking interactions"""
+        try:
+            # Look for overlay backdrops and dismiss them
+            overlay_selectors = [
+                "//div[contains(@class, 'cdk-overlay-backdrop')]",
+                "//div[contains(@class, 'mat-dialog-backdrop')]",
+                "//div[contains(@class, 'overlay-backdrop')]"
+            ]
+            
+            for selector in overlay_selectors:
+                overlays = self.driver.find_elements(By.XPATH, selector)
+                for overlay in overlays:
+                    try:
+                        if overlay.is_displayed():
+                            print("Found overlay backdrop, clicking to dismiss...")
+                            self.driver.execute_script("arguments[0].click();", overlay)
+                            time.sleep(1)
+                    except:
+                        pass
+                        
+            # Press ESC key to close any open dropdowns/dialogs
+            try:
+                self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(1)
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"Error dismissing overlays: {e}")
+
     def _submit_job_with_name(self, job_name):
         """Enter job name and submit the job
         
@@ -450,113 +510,176 @@ class AlphaFoldJobSubmitter:
             
             # Wait for the job name dialog to appear
             print("Waiting for job name dialog to appear...")
-            time.sleep(3)
+            time.sleep(5)
             
-            # Find job name input using the specific selectors you provided
+            # Dismiss any overlays that might be blocking interaction
+            self._dismiss_overlays()
+            
+            # Find job name input using the EXACT XPath you provided
             job_name_input = None
             input_selectors = [
-                By.ID, "mat-input-9",  # Your specific ID
-                By.XPATH, "//*[@id='mat-input-9']",  # Your XPath
-                By.XPATH, "//input[@id='mat-input-9']",
-                By.XPATH, "//*[@id='mat-mdc-dialog-1']//input[@matinput]",  # Input in the dialog
-                By.XPATH, "//mat-dialog-container//input[@matinput]",  # Input in any dialog
-                By.XPATH, "//input[@matinput and @required]",  # Required input field
-                By.XPATH, "//input[@pattern and @matinput]"  # Input with pattern attribute
+                "/html/body/div[3]/div[2]/div/mat-dialog-container/div/div/gdm-af-preview-dialog/main/form/mat-form-field/div[1]/div/div[2]/input",  # Your exact XPath
+                "//mat-dialog-container//input[@matinput]",  # Input in dialog container
+                "//gdm-af-preview-dialog//input[@matinput]",  # Input in preview dialog
+                "//input[@required and @matinput]",  # Required matinput field
+                "//form//input[@matinput]",  # Input in form
+                "//mat-form-field//input"  # Input in mat-form-field
             ]
             
-            for selector_type, selector_value in input_selectors:
+            for selector in input_selectors:
                 try:
+                    print(f"Trying selector: {selector}")
                     job_name_input = self.wait.until(
-                        EC.element_to_be_clickable((selector_type, selector_value))
+                        EC.presence_of_element_located((By.XPATH, selector))
                     )
-                    print(f"Found job name input using: {selector_type} = {selector_value}")
-                    break
+                    
+                    # Check if element is actually visible and interactable
+                    if job_name_input.is_displayed() and job_name_input.is_enabled():
+                        print(f"Found job name input using: {selector}")
+                        break
+                    else:
+                        print(f"Input found but not interactable with: {selector}")
+                        job_name_input = None
+                        
                 except TimeoutException:
-                    print(f"Could not find input with: {selector_type} = {selector_value}")
+                    print(f"Could not find input with: {selector}")
+                    continue
+                except Exception as e:
+                    print(f"Error with selector {selector}: {e}")
                     continue
             
             if not job_name_input:
+                # Take a screenshot for debugging
+                try:
+                    self.driver.save_screenshot("job_name_input_not_found.png")
+                    print("Screenshot saved: job_name_input_not_found.png")
+                except:
+                    pass
                 raise Exception("Could not find job name input field")
             
             # Ensure the input field is visible and focused
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", job_name_input)
+            print("Scrolling to job name input...")
+            self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", job_name_input)
+            time.sleep(2)
+            
+            # Click to focus on the input field
+            print("Clicking on job name input field...")
+            try:
+                job_name_input.click()
+            except Exception as click_error:
+                print(f"Regular click failed: {click_error}, trying JavaScript click...")
+                self.driver.execute_script("arguments[0].click();", job_name_input)
+            
             time.sleep(1)
             
-            # Clear the field thoroughly
+            # Clear the field thoroughly using multiple methods
             print("Clearing job name input field...")
-            job_name_input.click()
-            time.sleep(0.5)
             
-            # Select all text and delete (more reliable than clear())
-            job_name_input.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.5)
-            job_name_input.send_keys(Keys.DELETE)
-            time.sleep(0.5)
-            
-            # Alternative clearing method if above doesn't work
+            # Method 1: Select all and delete
             try:
-                current_value = job_name_input.get_attribute("value")
+                job_name_input.send_keys(Keys.CONTROL + "a")
+                time.sleep(0.5)
+                job_name_input.send_keys(Keys.DELETE)
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"Method 1 clearing failed: {e}")
+            
+            # Method 2: Check current value and clear with backspace
+            try:
+                current_value = job_name_input.get_attribute("value") or ""
                 if current_value:
                     print(f"Current value before clearing: '{current_value}'")
                     # Use backspace to clear character by character
                     for _ in range(len(current_value)):
                         job_name_input.send_keys(Keys.BACKSPACE)
-                    time.sleep(0.5)
-            except:
-                pass
+                        time.sleep(0.1)
+            except Exception as e:
+                print(f"Method 2 clearing failed: {e}")
+            
+            # Method 3: JavaScript clear
+            try:
+                self.driver.execute_script("arguments[0].value = '';", job_name_input)
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"Method 3 clearing failed: {e}")
+            
+            # Verify field is cleared
+            cleared_value = job_name_input.get_attribute("value") or ""
+            print(f"Value after clearing: '{cleared_value}'")
             
             # Enter the new job name
             print(f"Entering job name: '{job_name}'")
-            job_name_input.send_keys(job_name)
-            time.sleep(1)
+            try:
+                job_name_input.send_keys(job_name)
+                time.sleep(1)
+            except Exception as e:
+                print(f"Failed to type job name: {e}")
+                # Try JavaScript method
+                self.driver.execute_script(f"arguments[0].value = '{job_name}';", job_name_input)
+                # Trigger input events
+                self.driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", job_name_input)
+                self.driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", job_name_input)
+                time.sleep(1)
             
             # Verify the value was entered correctly
-            entered_value = job_name_input.get_attribute("value")
+            entered_value = job_name_input.get_attribute("value") or ""
             print(f"Value after entering: '{entered_value}'")
             
             if entered_value != job_name:
                 print(f"Warning: Entered value '{entered_value}' doesn't match expected '{job_name}'")
                 # Try one more time with JavaScript
                 self.driver.execute_script(f"arguments[0].value = '{job_name}';", job_name_input)
-                # Trigger change event
+                # Trigger change events
                 self.driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", job_name_input)
                 self.driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", job_name_input)
+                self.driver.execute_script("arguments[0].dispatchEvent(new Event('blur', { bubbles: true }));", job_name_input)
                 time.sleep(1)
                 
                 # Verify again
-                final_value = job_name_input.get_attribute("value")
+                final_value = job_name_input.get_attribute("value") or ""
                 print(f"Final value after JavaScript: '{final_value}'")
             
             # Find submit button using multiple selectors
             print("Looking for submit button...")
             submit_selectors = [
-                (By.XPATH, "//button[contains(text(), 'Confirm and submit job')]"),
-                (By.XPATH, "//button[normalize-space(text())='Confirm and submit job']"),
-                (By.XPATH, "//button[.//span[contains(text(), 'Confirm and submit job')]]"),
-                (By.XPATH, "//button[@aria-label='Confirm and submit job']"),
-                (By.XPATH, "//*[@id='mat-mdc-dialog-1']//button[contains(text(), 'Confirm')]"),
-                (By.XPATH, "//mat-dialog-container//button[contains(text(), 'Confirm')]"),
-                (By.XPATH, "//button[contains(@class, 'mat-mdc-button') and contains(text(), 'submit')]")
+                "//button[contains(text(), 'Confirm and submit job')]",
+                "//button[normalize-space(text())='Confirm and submit job']",
+                "//button[.//span[contains(text(), 'Confirm and submit job')]]",
+                "//mat-dialog-container//button[contains(text(), 'Confirm')]",
+                "//gdm-af-preview-dialog//button[contains(text(), 'Confirm')]",
+                "//button[contains(@class, 'mat-mdc-button') and contains(text(), 'submit')]",
+                "//form//button[contains(text(), 'submit')]"
             ]
             
             submit_button = None
-            for selector_type, selector_value in submit_selectors:
+            for selector in submit_selectors:
                 try:
+                    print(f"Trying submit button selector: {selector}")
                     submit_button = self.wait.until(
-                        EC.element_to_be_clickable((selector_type, selector_value))
+                        EC.element_to_be_clickable((By.XPATH, selector))
                     )
-                    print(f"Found submit button using: {selector_type} = {selector_value}")
+                    print(f"Found submit button using: {selector}")
                     break
                 except TimeoutException:
-                    print(f"Could not find submit button with: {selector_type} = {selector_value}")
+                    print(f"Could not find submit button with: {selector}")
+                    continue
+                except Exception as e:
+                    print(f"Error with submit selector {selector}: {e}")
                     continue
             
             if not submit_button:
+                # Take a screenshot for debugging
+                try:
+                    self.driver.save_screenshot("submit_button_not_found.png")
+                    print("Screenshot saved: submit_button_not_found.png")
+                except:
+                    pass
                 raise Exception("Could not find Submit button")
             
             # Scroll to submit button and click
-            self.driver.execute_script("arguments[0].scrollIntoView(true);", submit_button)
-            time.sleep(1)
+            print("Scrolling to submit button...")
+            self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", submit_button)
+            time.sleep(2)
             
             print("Clicking submit button...")
             try:

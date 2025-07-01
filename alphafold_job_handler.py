@@ -1,5 +1,5 @@
 """
-AlphaFold Job Handler
+AlphaFold Job Handler - FIXED VERSION
 Main orchestrator for AlphaFold job submission, monitoring, and downloading
 """
 import os
@@ -113,6 +113,19 @@ class AlphaFoldJobHandler(QThread):
         """Stop the job processing"""
         self.should_stop = True
         self.progress_update.emit("Stopping job processing...")
+    
+    def stop_batch(self):
+        """Stop the batch processing (alias for stop_processing)"""
+        self.stop_processing()
+    
+    def start_batch(self, jobs_list):
+        """Start batch processing with a list of jobs
+        
+        Args:
+            jobs_list: List of job dictionaries
+        """
+        self.set_jobs(jobs_list)
+        self.start()
     
     def run(self):
         """Main processing loop"""

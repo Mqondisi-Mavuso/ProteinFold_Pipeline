@@ -2434,28 +2434,96 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Setup Validation", validation_text)
 
     def stop_batch_submission(self):
-        """Stop the batch submission process"""
-        if self.batch_handler:
-            self.batch_handler.stop_batch()
-        
-        self.start_batch_button.setEnabled(True)
-        self.stop_batch_button.setEnabled(False)
-        self.resume_batch_button.setEnabled(True)
-        
-        self.batch_log.append("Batch submission stopped by user")
+        """Stop the batch submission process - FIXED VERSION"""
+        try:
+            if self.batch_handler:
+                # Check if the handler has the stop_batch method
+                if hasattr(self.batch_handler, 'stop_batch'):
+                    self.batch_handler.stop_batch()
+                elif hasattr(self.batch_handler, 'stop_processing'):
+                    self.batch_handler.stop_processing()
+                else:
+                    # Fallback: set should_stop flag if it exists
+                    if hasattr(self.batch_handler, 'should_stop'):
+                        self.batch_handler.should_stop = True
+                    
+                    # Try to terminate the thread
+                    if hasattr(self.batch_handler, 'terminate'):
+                        self.batch_handler.terminate()
+            
+            # Update UI state regardless of handler method availability
+            self.start_batch_button.setEnabled(True)
+            self.stop_batch_button.setEnabled(False)
+            self.resume_batch_button.setEnabled(True)
+            
+            # Update status
+            self.batch_status_label.setText("Batch submission stopped by user")
+            self.current_job_label.setText("Stopped")
+            
+            # Log the stop action
+            self.batch_log.append("⏹️ Batch submission stopped by user")
+            
+            print("Batch submission stopped successfully")
+            
+        except Exception as e:
+            error_msg = f"Error stopping batch submission: {str(e)}"
+            print(error_msg)
+            self.batch_log.append(f"⚠️ {error_msg}")
+            
+            # Still update UI to prevent getting stuck
+            self.start_batch_button.setEnabled(True)
+            self.stop_batch_button.setEnabled(False)
+            self.resume_batch_button.setEnabled(True)
+            self.batch_status_label.setText("Error stopping batch - manual intervention may be required")
 
     def resume_batch_submission(self):
-        """Resume the batch submission process"""
-        if self.batch_handler and self.current_job_index < len(self.batch_jobs):
-            remaining_jobs = self.batch_jobs[self.current_job_index:]
-            self.batch_handler.start_batch(remaining_jobs)
-            
-            self.start_batch_button.setEnabled(False)
-            self.stop_batch_button.setEnabled(True)
-            self.resume_batch_button.setEnabled(False)
-            
-            self.batch_log.append(f"Resumed batch submission with {len(remaining_jobs)} remaining jobs")
+        """Resume the batch submission process - IMPROVED VERSION"""
+        try:
+            if self.batch_handler and self.current_job_index < len(self.batch_jobs):
+                remaining_jobs = self.batch_jobs[self.current_job_index:]
+                
+                # Check if handler has the right method
+                if hasattr(self.batch_handler, 'start_batch'):
+                    self.batch_handler.start_batch(remaining_jobs)
+                elif hasattr(self.batch_handler, 'set_jobs'):
+                    self.batch_handler.set_jobs(remaining_jobs)
+                    if hasattr(self.batch_handler, 'start'):
+                        self.batch_handler.start()
+                else:
+                    # Create a new handler if the current one doesn't work
+                    self._restart_batch_with_remaining_jobs(remaining_jobs)
+                    return
+                
+                # Update UI
+                self.start_batch_button.setEnabled(False)
+                self.stop_batch_button.setEnabled(True)
+                self.resume_batch_button.setEnabled(False)
+                
+                self.batch_log.append(f"🔄 Resumed batch submission with {len(remaining_jobs)} remaining jobs")
+                
+            else:
+                self.batch_log.append("❌ Cannot resume: No batch handler or no remaining jobs")
+                
+        except Exception as e:
+            error_msg = f"Error resuming batch submission: {str(e)}"
+            print(error_msg)
+            self.batch_log.append(f"⚠️ {error_msg}")
     
+    def _restart_batch_with_remaining_jobs(self, remaining_jobs):
+        """Restart batch processing with remaining jobs"""
+        try:
+            # Reset job index
+            self.current_job_index = 0
+            self.batch_jobs = remaining_jobs
+            
+            # Start new batch
+            self.start_batch_submission()
+            
+        except Exception as e:
+            error_msg = f"Error restarting batch: {str(e)}"
+            print(error_msg)
+            self.batch_log.append(f"⚠️ {error_msg}")
+
     ############### Latest Code 
 
     def export_job_plan(self):
