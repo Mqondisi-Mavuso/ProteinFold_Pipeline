@@ -27,6 +27,16 @@ from alphafold_batch_handler import AlphaFoldBatchHandler
 from datetime import datetime
 from alphafold_login import AlphaFoldLogin
 
+import re  # Add this if not already imported
+from datetime import datetime  # Add this if not already imported
+
+# Add these new imports for the AlphaFold automation
+from alphafold_job_handler import AlphaFoldJobHandler
+from alphafold_browser_manager import AlphaFoldBrowserManager
+from alphafold_job_submitter import AlphaFoldJobSubmitter
+from alphafold_job_monitor import AlphaFoldJobMonitor
+from alphafold_job_downloader import AlphaFoldJobDownloader
+
 # Configuration constants you can adjust
 class BatchConfig:
     # Job timing (in seconds)
@@ -100,6 +110,15 @@ class MainWindow(QMainWindow):
         
         # Create the AlphaFold submitter
         self.alphafold_submitter = AlphaFoldSubmitter()
+        # Download configuration variables
+        self.download_directory = None
+
+        # Batch processing tracking
+        self.successful_jobs = []
+        self.failed_jobs = []
+
+        # AlphaFold automation handler
+        self.batch_handler = None
         
         self.initUI()
         
@@ -1617,6 +1636,66 @@ class MainWindow(QMainWindow):
         submission_layout.addWidget(roi_group)
         
         # Job Management Section
+        
+        # Download Configuration Section (NEW)
+        download_group = QGroupBox("Download Configuration")
+        download_layout = QVBoxLayout()
+
+        # Download directory selection
+        download_dir_layout = QHBoxLayout()
+        download_dir_layout.addWidget(QLabel("Download Directory:"))
+        self.download_dir_label = QLabel("No directory selected")
+        self.download_dir_label.setStyleSheet("border: 1px solid #ccc; padding: 5px; background-color: #f9f9f9;")
+        download_dir_layout.addWidget(self.download_dir_label)
+
+        self.browse_download_dir_button = QPushButton("Browse")
+        self.browse_download_dir_button.clicked.connect(self.browse_download_directory)
+        download_dir_layout.addWidget(self.browse_download_dir_button)
+
+        download_layout.addLayout(download_dir_layout)
+
+        # Download settings
+        download_settings_layout = QHBoxLayout()
+
+        # Job timeout setting
+        download_settings_layout.addWidget(QLabel("Job Timeout:"))
+        self.job_timeout_input = QSpinBox()
+        self.job_timeout_input.setRange(30, 300)  # 30 minutes to 5 hours
+        self.job_timeout_input.setValue(120)  # Default 2 hours
+        self.job_timeout_input.setSuffix(" minutes")
+        download_settings_layout.addWidget(self.job_timeout_input)
+
+        # Status check interval
+        download_settings_layout.addWidget(QLabel("Check Interval:"))
+        self.status_check_interval = QSpinBox()
+        self.status_check_interval.setRange(1, 30)  # 1 to 30 minutes
+        self.status_check_interval.setValue(5)  # Default 5 minutes
+        self.status_check_interval.setSuffix(" minutes")
+        download_settings_layout.addWidget(self.status_check_interval)
+
+        download_settings_layout.addStretch()
+        download_layout.addLayout(download_settings_layout)
+
+        # Download status
+        download_status_layout = QHBoxLayout()
+        self.download_status_label = QLabel("Download folder: Not configured")
+        self.download_status_label.setStyleSheet("color: #666; font-size: 11px;")
+        download_status_layout.addWidget(self.download_status_label)
+        download_status_layout.addStretch()
+
+        # Auto-open downloads folder checkbox
+        self.auto_open_downloads = QCheckBox("Open downloads folder when batch completes")
+        self.auto_open_downloads.setChecked(True)
+        download_status_layout.addWidget(self.auto_open_downloads)
+
+        download_layout.addLayout(download_status_layout)
+
+        download_group.setLayout(download_layout)
+        submission_layout.addWidget(download_group)
+
+        # Initialize download directory variable
+        self.download_directory = None
+
         job_group = QGroupBox("Batch Job Management")
         job_layout = QVBoxLayout()
         
@@ -2027,63 +2106,96 @@ class MainWindow(QMainWindow):
             self.batch_status_label.setText("Ready for batch submission")
 
     def start_batch_submission(self):
-        """Start the batch submission process"""
-        if not self.selected_protein or not self.roi_data:
-            QMessageBox.warning(self, "Error", "Please select a protein and load ROI data first.")
-            return
-        
-        # Prepare batch jobs
-        self.prepare_batch_jobs()
-        
-        # Check job limit
-        job_limit = self.job_limit_input.value()
-        if len(self.batch_jobs) > job_limit:
-            reply = QMessageBox.question(
-                self,
-                "Job Limit Warning",
-                f"You have {len(self.batch_jobs)} jobs to submit but your daily limit is {job_limit}.\n"
-                f"Do you want to submit only the first {job_limit} jobs?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        """Start the batch submission process with AlphaFold automation"""
+        try:
+            # Validate all requirements
+            if not self._validate_batch_requirements():
+                return
+            
+            # Get download configuration
+            download_config = self.get_download_configuration()
+            
+            # Validate download configuration
+            download_valid, download_msg = self.validate_download_configuration()
+            if not download_valid:
+                QMessageBox.critical(self, "Download Configuration Error", download_msg)
+                return
+            
+            # Prepare batch jobs
+            self.prepare_batch_jobs()
+            
+            # Check job limit
+            job_limit = self.job_limit_input.value()
+            if len(self.batch_jobs) > job_limit:
+                reply = QMessageBox.question(
+                    self,
+                    "Job Limit Warning",
+                    f"You have {len(self.batch_jobs)} jobs to submit but your daily limit is {job_limit}.\n"
+                    f"Do you want to submit only the first {job_limit} jobs?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.batch_jobs = self.batch_jobs[:job_limit]
+                else:
+                    return
+            
+            # Initialize progress tracking
+            self.current_job_index = 0
+            self.successful_jobs = []
+            self.failed_jobs = []
+            
+            # Update UI state
+            self._set_batch_ui_state(processing=True)
+            
+            # Log batch start
+            self.batch_log.append("="*50)
+            self.batch_log.append(f"STARTING BATCH SUBMISSION")
+            self.batch_log.append(f"Protein: {self.selected_protein['name']}")
+            self.batch_log.append(f"Total jobs: {len(self.batch_jobs)}")
+            self.batch_log.append(f"Download directory: {download_config['download_directory']}")
+            self.batch_log.append(f"Job timeout: {download_config['job_timeout_minutes']} minutes")
+            self.batch_log.append("="*50)
+            
+            # Create and start the AlphaFold job handler
+            from alphafold_job_handler import AlphaFoldJobHandler
+            
+            self.batch_handler = AlphaFoldJobHandler(
+                login_handler=self.alphafold_login_handler,
+                download_config=download_config
             )
             
-            if reply == QMessageBox.StandardButton.Yes:
-                self.batch_jobs = self.batch_jobs[:job_limit]
-            else:
-                return
-        
-        # Start batch submission
-        self.current_job_index = 0
-        self.start_batch_button.setEnabled(False)
-        self.stop_batch_button.setEnabled(True)
-        
-        # Start the batch thread
-        from alphafold_batch_handler import AlphaFoldBatchHandler
-        
-        self.batch_handler = AlphaFoldBatchHandler(
-            self.alphafold_email.text().strip(),
-            self.alphafold_password.text().strip()
-        )
-        
-        # Connect signals and start
-        self.batch_handler.job_completed.connect(self.on_job_completed)
-        self.batch_handler.job_failed.connect(self.on_job_failed)
-        self.batch_handler.batch_completed.connect(self.on_batch_completed)
-        self.batch_handler.progress_update.connect(self.on_batch_progress)
-        
-        self.batch_handler.start_batch(self.batch_jobs)
-        
-        self.batch_log.append(f"Started batch submission of {len(self.batch_jobs)} jobs")
+            # Connect signals for real-time updates
+            self.batch_handler.progress_update.connect(self.on_automation_progress)
+            self.batch_handler.job_started.connect(self.on_automation_job_started)
+            self.batch_handler.job_completed.connect(self.on_automation_job_completed)
+            self.batch_handler.job_failed.connect(self.on_automation_job_failed)
+            self.batch_handler.batch_completed.connect(self.on_automation_batch_completed)
+            self.batch_handler.job_progress.connect(self.on_automation_job_progress)
+            
+            # Set jobs and start processing
+            self.batch_handler.set_jobs(self.batch_jobs)
+            self.batch_handler.start()
+            
+            self.batch_log.append("✓ AlphaFold automation started successfully")
+            
+        except Exception as e:
+            self._handle_batch_error(f"Error starting batch submission: {str(e)}")
 
     def prepare_batch_jobs(self):
-        """Prepare the list of jobs for batch submission"""
+        """Prepare the list of jobs for batch submission (Updated)"""
         self.batch_jobs = []
         
         for roi in self.roi_data:
-            # Generate job name
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+            # Generate job name with more precise timestamp
+            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
             
+            # Create job name: Protein-DNA_ProteinName_GeneName_Locus_Timestamp
             job_name = f"Protein-DNA_{self.selected_protein['name']}_{roi['gene_name']}_{roi['roi_locus']}_{timestamp}"
+            
+            # Ensure job name is valid for AlphaFold (remove invalid characters)
+            import re
+            job_name = re.sub(r'[^\w\-_\.: ]', '_', job_name)
             
             job = {
                 'job_name': job_name,
@@ -2092,10 +2204,234 @@ class MainWindow(QMainWindow):
                 'dna_sequence': roi['roi_sequence'],
                 'gene_name': roi['gene_name'],
                 'roi_locus': roi['roi_locus'],
-                'accession': roi['accession']
+                'accession': roi.get('accession', 'Unknown'),
+                'created_time': datetime.now().isoformat()
             }
             
             self.batch_jobs.append(job)
+        
+        self.batch_log.append(f"Prepared {len(self.batch_jobs)} jobs for submission")
+
+    def _validate_batch_requirements(self):
+        """Validate all requirements for batch submission"""
+        # Check protein selection
+        if not self.selected_protein:
+            QMessageBox.warning(self, "Missing Protein", "Please select a protein sequence first.")
+            return False
+        
+        # Check ROI data
+        if not self.roi_data:
+            QMessageBox.warning(self, "Missing ROI Data", "Please load ROI data first.")
+            return False
+        
+        # Check login status
+        if not self.is_logged_in:
+            QMessageBox.warning(self, "Not Logged In", "Please login to AlphaFold 3 first.")
+            return False
+        
+        # Check if login handler has active session
+        if not self.alphafold_login_handler or not hasattr(self.alphafold_login_handler, 'driver'):
+            QMessageBox.warning(self, "Login Session Error", 
+                            "No active login session found. Please login again.")
+            return False
+        
+        return True
+    
+    def _set_batch_ui_state(self, processing=False):
+        """Set UI state for batch processing"""
+        # Update button states
+        self.start_batch_button.setEnabled(not processing)
+        self.stop_batch_button.setEnabled(processing)
+        self.resume_batch_button.setEnabled(False)
+        
+        # Update other controls
+        self.validate_setup_button.setEnabled(not processing)
+        self.export_plan_button.setEnabled(not processing)
+        self.manual_login_button.setEnabled(not processing)
+        self.auto_login_button.setEnabled(not processing)
+        
+        if processing:
+            self.batch_status_label.setText("Processing batch jobs...")
+            self.start_batch_button.setText("Processing...")
+        else:
+            self.batch_status_label.setText("Ready for batch submission")
+            self.start_batch_button.setText("Start Batch Submission")
+
+    def _handle_batch_error(self, error_message):
+        """Handle batch processing errors"""
+        # Reset UI state
+        self._set_batch_ui_state(processing=False)
+        self.resume_batch_button.setEnabled(True)
+        
+        # Log error
+        self.batch_log.append(f"💥 ERROR: {error_message}")
+        
+        # Show error dialog
+        QMessageBox.critical(self, "Batch Processing Error", error_message)
+
+    def on_automation_progress(self, message):
+        """Handle progress updates from automation"""
+        self.batch_log.append(f"[INFO] {message}")
+        
+        # Auto-scroll to bottom
+        scrollbar = self.batch_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def on_automation_job_started(self, job_name, job_id):
+        """Handle job started signal"""
+        self.current_job_label.setText(f"Current: {job_name}")
+        self.batch_log.append(f"🚀 Started: {job_name} (ID: {job_id})")
+
+    def on_automation_job_completed(self, job_name, job_id, download_path):
+        """Handle job completed signal"""
+        self.current_job_index += 1
+        self.jobs_completed_label.setText(f"Jobs completed: {self.current_job_index}")
+        
+        # Store successful job info
+        self.successful_jobs.append({
+            'name': job_name,
+            'id': job_id,
+            'download_path': download_path,
+            'completed_time': datetime.now().isoformat()
+        })
+        
+        self.batch_log.append(f"✅ Completed: {job_name}")
+        self.batch_log.append(f"   Downloaded: {download_path}")
+
+    def on_automation_job_failed(self, job_name, error_message):
+        """Handle job failed signal"""
+        self.current_job_index += 1
+        self.jobs_completed_label.setText(f"Jobs processed: {self.current_job_index}")
+        
+        # Store failed job info
+        self.failed_jobs.append({
+            'name': job_name,
+            'error': error_message,
+            'failed_time': datetime.now().isoformat()
+        })
+        
+        self.batch_log.append(f"❌ Failed: {job_name}")
+        self.batch_log.append(f"   Error: {error_message}")
+
+    def on_automation_batch_completed(self, summary):
+        """Handle batch completion signal"""
+        # Reset UI state
+        self._set_batch_ui_state(processing=False)
+        
+        # Update final status
+        self.batch_status_label.setText("Batch completed!")
+        self.current_job_label.setText("All jobs processed")
+        
+        # Log final summary
+        successful = summary.get('successful_jobs', 0)
+        failed = summary.get('failed_jobs', 0)
+        total = summary.get('total_jobs', 0)
+        success_rate = summary.get('success_rate', 0)
+        
+        self.batch_log.append("="*50)
+        self.batch_log.append("🎉 BATCH COMPLETED!")
+        self.batch_log.append(f"Total jobs: {total}")
+        self.batch_log.append(f"Successful: {successful}")
+        self.batch_log.append(f"Failed: {failed}")
+        self.batch_log.append(f"Success rate: {success_rate:.1f}%")
+        self.batch_log.append("="*50)
+        
+        # Show completion dialog
+        completion_message = (
+            f"Batch processing completed!\n\n"
+            f"Protein: {self.selected_protein['name']}\n"
+            f"Total jobs: {total}\n"
+            f"Successful: {successful}\n"
+            f"Failed: {failed}\n"
+            f"Success rate: {success_rate:.1f}%\n\n"
+            f"Results saved to: {self.download_directory}\n\n"
+            f"Check the batch log for detailed information."
+        )
+        
+        QMessageBox.information(self, "Batch Complete", completion_message)
+        
+        # Open downloads folder if requested
+        download_config = self.get_download_configuration()
+        if download_config.get('auto_open_downloads', False):
+            try:
+                import subprocess
+                import platform
+                
+                if platform.system() == "Windows":
+                    subprocess.Popen(f'explorer "{self.download_directory}"')
+                elif platform.system() == "Darwin":  # macOS
+                    subprocess.Popen(["open", self.download_directory])
+                else:  # Linux
+                    subprocess.Popen(["xdg-open", self.download_directory])
+            except Exception as e:
+                self.batch_log.append(f"Could not open downloads folder: {str(e)}")
+
+    def on_automation_job_progress(self, current_job, total_jobs, current_status):
+        """Handle job progress updates"""
+        # Update progress bar
+        self.batch_progress_bar.setMaximum(total_jobs)
+        self.batch_progress_bar.setValue(current_job)
+        
+        # Update status
+        progress_percent = int((current_job / total_jobs) * 100) if total_jobs > 0 else 0
+        self.batch_status_label.setText(f"Processing job {current_job}/{total_jobs} ({progress_percent}%)")
+
+    # 5. UPDATE validate_current_setup method - ADD download validation:
+    def validate_current_setup(self):
+        """Validate the current protein and ROI setup before submission"""
+        validation_messages = []
+        
+        # Check protein selection
+        if not self.selected_protein:
+            validation_messages.append("❌ No protein selected")
+        else:
+            validation_messages.append(f"✓ Protein: {self.selected_protein['name']} ({self.selected_protein['length']} AA)")
+            if self.selected_protein.get('warnings'):
+                validation_messages.append(f"  ⚠️ Warnings: {len(self.selected_protein['warnings'])}")
+        
+        # Check ROI data
+        if not self.roi_data:
+            validation_messages.append("❌ No ROI data loaded")
+        else:
+            validation_messages.append(f"✓ ROI sequences: {len(self.roi_data)}")
+            valid_rois = [roi for roi in self.roi_data if roi.get('is_valid', True)]
+            if len(valid_rois) != len(self.roi_data):
+                validation_messages.append(f"  ⚠️ {len(self.roi_data) - len(valid_rois)} ROI sequences have warnings")
+        
+        # Check login status
+        if self.is_logged_in:
+            validation_messages.append("✓ Logged in to AlphaFold 3")
+        else:
+            validation_messages.append("❌ Not logged in to AlphaFold 3")
+        
+        # Check download configuration (NEW)
+        download_valid, download_msg = self.validate_download_configuration()
+        if download_valid:
+            validation_messages.append(f"✓ Download directory: {self.download_directory}")
+            config = self.get_download_configuration()
+            validation_messages.append(f"✓ Job timeout: {config['job_timeout_minutes']} minutes")
+            validation_messages.append(f"✓ Status check interval: {config['status_check_interval_minutes']} minutes")
+        else:
+            validation_messages.append(f"❌ Download configuration: {download_msg}")
+        
+        # Calculate job estimates
+        if self.selected_protein and self.roi_data:
+            total_jobs = len(self.roi_data)
+            job_limit = self.job_limit_input.value()
+            
+            validation_messages.append(f"📊 Total jobs planned: {total_jobs}")
+            validation_messages.append(f"📊 Daily job limit: {job_limit}")
+            
+            if total_jobs > job_limit:
+                validation_messages.append(f"⚠️ Jobs exceed daily limit by {total_jobs - job_limit}")
+            
+            # Estimate processing time
+            estimated_hours = total_jobs * 0.5  # Rough estimate: 30 minutes per job
+            validation_messages.append(f"⏱️ Estimated total processing time: {estimated_hours:.1f} hours")
+        
+        # Show validation dialog
+        validation_text = "\n".join(validation_messages)
+        QMessageBox.information(self, "Setup Validation", validation_text)
 
     def stop_batch_submission(self):
         """Stop the batch submission process"""
@@ -2119,74 +2455,8 @@ class MainWindow(QMainWindow):
             self.resume_batch_button.setEnabled(False)
             
             self.batch_log.append(f"Resumed batch submission with {len(remaining_jobs)} remaining jobs")
-
-    def on_job_completed(self, job_info, job_id, results_path):
-        """Handle individual job completion"""
-        self.current_job_index += 1
-        self.jobs_completed_label.setText(f"Jobs completed: {self.current_job_index}")
-        
-        progress = int((self.current_job_index / len(self.batch_jobs)) * 100)
-        self.batch_progress_bar.setValue(progress)
-        
-        self.current_job_label.setText(f"Completed: {job_info['job_name']}")
-        self.batch_log.append(f"✓ Completed: {job_info['job_name']} (ID: {job_id})")
-
-    def on_job_failed(self, job_info, error_message):
-        """Handle individual job failure"""
-        self.current_job_index += 1
-        self.jobs_completed_label.setText(f"Jobs completed: {self.current_job_index}")
-        
-        progress = int((self.current_job_index / len(self.batch_jobs)) * 100)
-        self.batch_progress_bar.setValue(progress)
-        
-        self.current_job_label.setText(f"Failed: {job_info['job_name']}")
-        self.batch_log.append(f"✗ Failed: {job_info['job_name']} - {error_message}")
-
-    def on_batch_completed(self, summary):
-        """Handle batch completion"""
-        self.start_batch_button.setEnabled(True)
-        self.stop_batch_button.setEnabled(False)
-        self.resume_batch_button.setEnabled(False)
-        
-        self.batch_status_label.setText("Batch completed!")
-        self.current_job_label.setText("All jobs processed")
-        
-        successful = summary.get('successful', 0)
-        failed = summary.get('failed', 0)
-        total = summary.get('total', 0)
-        
-        self.batch_log.append("="*50)
-        self.batch_log.append(f"BATCH COMPLETED!")
-        self.batch_log.append(f"Total jobs: {total}")
-        self.batch_log.append(f"Successful: {successful}")
-        self.batch_log.append(f"Failed: {failed}")
-        self.batch_log.append(f"Success rate: {(successful/total*100):.1f}%" if total > 0 else "0%")
-        self.batch_log.append(f"Results directory: {summary.get('output_directory', 'Unknown')}")
-        self.batch_log.append("="*50)
-        
-        # Show completion dialog
-        QMessageBox.information(
-            self,
-            "Batch Complete",
-            f"Batch submission completed!\n\n"
-            f"Protein: {self.selected_protein['name']}\n"
-            f"Total jobs: {total}\n"
-            f"Successful: {successful}\n"
-            f"Failed: {failed}\n"
-            f"Success rate: {(successful/total*100):.1f}%" if total > 0 else "0%\n\n"
-            f"Results saved to:\n{summary.get('output_directory', 'Unknown')}\n\n"
-            f"Check the batch log for detailed information about each job."
-        )
-
-    def on_batch_progress(self, message):
-        """Handle batch progress updates"""
-        self.batch_status_label.setText(message)
-        self.batch_log.append(f"[INFO] {message}")
+    
     ############### Latest Code 
-    def on_job_limit_reached(self, message):
-        """Handle job limit reached signal"""
-        self.batch_log.append(f"[WARNING] {message}")
-        QMessageBox.warning(self, "Job Limit Reached", message)
 
     def export_job_plan(self):
         """Export the current job plan to Excel for review"""
@@ -2529,5 +2799,160 @@ class MainWindow(QMainWindow):
             # Reset button state
             self.check_login_button.setEnabled(True)
             self.check_login_button.setText("Check Login Status")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~ Download AlphaFold 3 Results ~~~~~~~~~~~~~~~~
+    
+    def browse_download_directory(self):
+        """Browse for download directory"""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Download Directory for AlphaFold Results",
+            "",
+            QFileDialog.Option.ShowDirsOnly
+        )
         
+        if directory:
+            self.download_directory = directory
+            
+            # Update UI
+            self.download_dir_label.setText(directory)
+            self.download_status_label.setText(f"Download folder: {directory}")
+            self.download_status_label.setStyleSheet("color: green; font-size: 11px;")
+            
+            # Update batch submit button state
+            self.update_batch_submit_button()
+            
+            # Log the change
+            self.batch_log.append(f"Download directory set: {directory}")
+            
+            QMessageBox.information(
+                self,
+                "Download Directory Set",
+                f"AlphaFold results will be downloaded to:\n{directory}"
+            )
+   
+    def validate_download_configuration(self):
+        """Validate that download configuration is properly set"""
+        if not self.download_directory:
+            return False, "Download directory not selected"
         
+        if not os.path.exists(self.download_directory):
+            return False, f"Download directory does not exist: {self.download_directory}"
+        
+        if not os.access(self.download_directory, os.W_OK):
+            return False, f"No write permission for download directory: {self.download_directory}"
+        
+        return True, "Download configuration is valid"
+
+    def get_download_configuration(self):
+        """Get the current download configuration"""
+        return {
+            'download_directory': self.download_directory,
+            'job_timeout_minutes': self.job_timeout_input.value(),
+            'status_check_interval_minutes': self.status_check_interval.value(),
+            'auto_open_downloads': self.auto_open_downloads.isChecked()
+        }
+
+    # Update your existing update_batch_submit_button method to include download check
+    def update_batch_submit_button(self):
+        """Updated the batch submit button state (modified to include download directory check)"""
+        has_protein = self.selected_protein is not None
+        has_roi = len(self.roi_data) > 0
+        is_logged_in = self.is_logged_in
+        has_download_dir = self.download_directory is not None  # NEW: Check download directory
+        
+        can_submit = has_protein and has_roi and is_logged_in and has_download_dir
+        self.start_batch_button.setEnabled(can_submit)
+        
+        # Enable export button if we have protein and ROI data
+        can_export = has_protein and has_roi
+        self.export_plan_button.setEnabled(can_export)
+        
+        # Update job count and prepare batch jobs for export
+        if has_protein and has_roi:
+            try:
+                selected_protein_index = self.protein_data.index(self.selected_protein)
+                job_limit = self.job_limit_input.value()
+                from protein_roi_loader import create_job_batch
+                self.batch_jobs, _ = create_job_batch(
+                    self.protein_data, 
+                    self.roi_data, 
+                    selected_protein_index, 
+                    job_limit
+                )
+                total_jobs = len(self.batch_jobs)
+                self.total_jobs_label.setText(f"Total jobs to submit: {total_jobs}")
+            except Exception:
+                self.total_jobs_label.setText("Total jobs to submit: 0")
+        else:
+            self.total_jobs_label.setText("Total jobs to submit: 0")
+            self.batch_jobs = []
+        
+        # Update status message based on what's missing
+        if not is_logged_in:
+            self.batch_status_label.setText("Please login to AlphaFold 3 first")
+        elif not has_protein:
+            self.batch_status_label.setText("Please select a protein sequence")
+        elif not has_roi:
+            self.batch_status_label.setText("Please load ROI data")
+        elif not has_download_dir:
+            self.batch_status_label.setText("Please select download directory")
+        else:
+            self.batch_status_label.setText("Ready for batch submission")
+
+    # Update your existing validate_current_setup method to include download validation
+    def validate_current_setup(self):
+        """Validate the current protein and ROI setup before submission"""
+        validation_messages = []
+        
+        # Check protein selection
+        if not self.selected_protein:
+            validation_messages.append("❌ No protein selected")
+        else:
+            validation_messages.append(f"✓ Protein: {self.selected_protein['name']} ({self.selected_protein['length']} AA)")
+            if self.selected_protein.get('warnings'):
+                validation_messages.append(f"  ⚠️ Warnings: {len(self.selected_protein['warnings'])}")
+        
+        # Check ROI data
+        if not self.roi_data:
+            validation_messages.append("❌ No ROI data loaded")
+        else:
+            validation_messages.append(f"✓ ROI sequences: {len(self.roi_data)}")
+            valid_rois = [roi for roi in self.roi_data if roi.get('is_valid', True)]
+            if len(valid_rois) != len(self.roi_data):
+                validation_messages.append(f"  ⚠️ {len(self.roi_data) - len(valid_rois)} ROI sequences have warnings")
+        
+        # Check login status
+        if self.is_logged_in:
+            validation_messages.append("✓ Logged in to AlphaFold 3")
+        else:
+            validation_messages.append("❌ Not logged in to AlphaFold 3")
+        
+        # Check download configuration (NEW)
+        download_valid, download_msg = self.validate_download_configuration()
+        if download_valid:
+            validation_messages.append(f"✓ Download directory: {self.download_directory}")
+            config = self.get_download_configuration()
+            validation_messages.append(f"✓ Job timeout: {config['job_timeout_minutes']} minutes")
+            validation_messages.append(f"✓ Status check interval: {config['status_check_interval_minutes']} minutes")
+        else:
+            validation_messages.append(f"❌ Download configuration: {download_msg}")
+        
+        # Calculate job estimates
+        if self.selected_protein and self.roi_data:
+            total_jobs = len(self.roi_data)
+            job_limit = self.job_limit_input.value()
+            
+            validation_messages.append(f"📊 Total jobs planned: {total_jobs}")
+            validation_messages.append(f"📊 Daily job limit: {job_limit}")
+            
+            if total_jobs > job_limit:
+                validation_messages.append(f"⚠️ Jobs exceed daily limit by {total_jobs - job_limit}")
+            
+            # Estimate processing time
+            estimated_hours = total_jobs * 0.5  # Rough estimate: 30 minutes per job
+            validation_messages.append(f"⏱️ Estimated total processing time: {estimated_hours:.1f} hours")
+        
+        # Show validation dialog
+        validation_text = "\n".join(validation_messages)
+        QMessageBox.information(self, "Setup Validation", validation_text)    

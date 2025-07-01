@@ -8,3 +8,8 @@ browser_screenshots/
 alphafold_page.html
 bulk_sequences/
 roi_analysis_summary.xlsx
+Protein_Seq_List.xlsx
+alphafold_cookies.pkl
+alphafold_batch_results/
+test_chrome.py
+automation_screenshots/
