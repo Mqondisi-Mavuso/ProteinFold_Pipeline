@@ -1,6 +1,6 @@
 """
-AlphaFold Job Downloader
-Handles downloading of completed AlphaFold job results
+AlphaFold Job Downloader - UPDATED VERSION
+Handles downloading of completed AlphaFold job results and taking screenshots of results pages
 """
 import os
 import time
@@ -12,7 +12,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 
 class AlphaFoldJobDownloader:
-    """Downloads completed AlphaFold job results"""
+    """Downloads completed AlphaFold job results and captures screenshots"""
     
     def __init__(self, driver, download_directory):
         """Initialize job downloader
@@ -29,15 +29,16 @@ class AlphaFoldJobDownloader:
         # Ensure download directory exists
         os.makedirs(self.download_directory, exist_ok=True)
     
-    def download_job_results(self, job_name, max_wait_minutes=5):
-        """Download results for a completed job
+    def download_job_results(self, job_name, max_wait_minutes=5, take_screenshot=True):
+        """Download results for a completed job and optionally take screenshot
         
         Args:
             job_name (str): Name of the job to download
             max_wait_minutes (int): Maximum time to wait for download
+            take_screenshot (bool): Whether to take screenshot of results page
             
         Returns:
-            str: Path to downloaded file if successful, None if failed
+            dict: Download info with file path and screenshot path if successful, None if failed
         """
         try:
             print(f"Starting download for job: {job_name}")
@@ -68,16 +69,144 @@ class AlphaFoldJobDownloader:
                 max_wait_minutes
             )
             
-            if downloaded_file:
-                print(f"Successfully downloaded: {downloaded_file}")
-                return downloaded_file
-            else:
+            if not downloaded_file:
                 print(f"Download failed or timed out for job: {job_name}")
                 return None
+            
+            print(f"Successfully downloaded: {downloaded_file}")
+            
+            # Take screenshot of results page if requested
+            screenshot_path = None
+            if take_screenshot:
+                screenshot_path = self._take_results_screenshot(job_name, job_row)
+            
+            return {
+                'downloaded_file': downloaded_file,
+                'screenshot_path': screenshot_path,
+                'job_name': job_name
+            }
                 
         except Exception as e:
             print(f"Error downloading job results: {e}")
             return None
+    
+    def _take_results_screenshot(self, job_name, job_row):
+        """Take screenshot of the results page for a job
+        
+        Args:
+            job_name (str): Name of the job
+            job_row: WebElement of the job row (to click options menu again)
+            
+        Returns:
+            str: Path to screenshot file if successful, None if failed
+        """
+        try:
+            print(f"Taking screenshot of results page for job: {job_name}")
+            
+            # Wait a moment for any previous actions to complete
+            time.sleep(2)
+            
+            # Click the options menu again
+            if not self._click_job_options_menu(job_row):
+                print("Failed to open job options menu for screenshot")
+                return None
+            
+            # Click the "Open results" option
+            if not self._click_open_results_option():
+                print("Failed to click 'Open results' option")
+                return None
+            
+            # Wait for results page to load
+            print("Waiting for results page to load...")
+            time.sleep(5)  # Wait 5 seconds as requested
+            
+            # Take screenshot
+            screenshot_filename = f"{job_name}_results_page.png"
+            screenshot_path = os.path.join(self.download_directory, screenshot_filename)
+            
+            # Clean filename to be safe for file system
+            safe_filename = self._clean_filename(screenshot_filename)
+            screenshot_path = os.path.join(self.download_directory, safe_filename)
+            
+            self.driver.save_screenshot(screenshot_path)
+            
+            print(f"Screenshot saved: {screenshot_path}")
+            return screenshot_path
+            
+        except Exception as e:
+            print(f"Error taking results screenshot: {e}")
+            return None
+    
+    def _click_open_results_option(self):
+        """Click the 'Open results' option from the dropdown menu
+        
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Wait for dropdown menu to appear and look for "Open results" link
+            open_results_selectors = [
+                "//a[@mat-menu-item]//span[contains(text(), 'Open results')]/..",
+                "//a[@mat-menu-item and contains(@href, '/fold/')]",
+                "//a[contains(@class, 'mat-mdc-menu-item')]//span[contains(text(), 'Open results')]/..",
+                "//a[@mat-menu-item]//mat-icon[text()='check']/..",
+                "/html/body/div[2]/div[2]/div/div/div/a[1]"  # Fallback to full XPath
+            ]
+            
+            open_results_element = None
+            for selector in open_results_selectors:
+                try:
+                    open_results_element = self.wait.until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                    print(f"Found 'Open results' element using selector: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not open_results_element:
+                # Try to find any menu item with "results" in the text
+                menu_items = self.driver.find_elements(
+                    By.XPATH, "//a[@mat-menu-item] | //button[@mat-menu-item]"
+                )
+                
+                for item in menu_items:
+                    item_text = item.text.lower()
+                    if "results" in item_text or "open" in item_text:
+                        open_results_element = item
+                        print(f"Found potential 'Open results' item: {item_text}")
+                        break
+            
+            if not open_results_element:
+                print("Could not find 'Open results' option in menu")
+                return False
+            
+            # Click the open results option
+            self.driver.execute_script("arguments[0].click();", open_results_element)
+            time.sleep(2)
+            
+            print("Successfully clicked 'Open results' option")
+            return True
+            
+        except Exception as e:
+            print(f"Error clicking 'Open results' option: {e}")
+            return False
+    
+    def _clean_filename(self, filename):
+        """Clean filename to be safe for file system
+        
+        Args:
+            filename (str): Original filename
+            
+        Returns:
+            str: Cleaned filename
+        """
+        import re
+        # Remove or replace invalid characters
+        cleaned = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        # Remove multiple underscores
+        cleaned = re.sub(r'_+', '_', cleaned)
+        return cleaned
     
     def _find_job_row(self, job_name):
         """Find the table row for a specific job
@@ -282,8 +411,8 @@ class AlphaFoldJobDownloader:
             if not files:
                 return None
             
-            # Filter out temporary files
-            valid_files = [f for f in files if not f.endswith(('.crdownload', '.tmp', '.part'))]
+            # Filter out temporary files and screenshots
+            valid_files = [f for f in files if not f.endswith(('.crdownload', '.tmp', '.part', '.png'))]
             
             if not valid_files:
                 return None
@@ -326,14 +455,17 @@ class AlphaFoldJobDownloader:
             print(f"Error checking if file is job-related: {e}")
             return True  # Default to True if we can't determine
     
-    def download_all_completed_jobs(self):
+    def download_all_completed_jobs(self, take_screenshots=True):
         """Download all completed jobs in the table
         
+        Args:
+            take_screenshots (bool): Whether to take screenshots of results pages
+            
         Returns:
-            list: List of downloaded file paths
+            list: List of download result dictionaries
         """
         try:
-            downloaded_files = []
+            download_results = []
             
             # Get all completed jobs
             completed_jobs = self._get_completed_jobs()
@@ -341,17 +473,19 @@ class AlphaFoldJobDownloader:
             for job_name in completed_jobs:
                 print(f"Downloading results for: {job_name}")
                 
-                downloaded_file = self.download_job_results(job_name)
-                if downloaded_file:
-                    downloaded_files.append(downloaded_file)
-                    print(f"Downloaded: {downloaded_file}")
+                download_result = self.download_job_results(job_name, take_screenshot=take_screenshots)
+                if download_result:
+                    download_results.append(download_result)
+                    print(f"Downloaded: {download_result['downloaded_file']}")
+                    if download_result['screenshot_path']:
+                        print(f"Screenshot: {download_result['screenshot_path']}")
                 else:
                     print(f"Failed to download: {job_name}")
                 
                 # Small delay between downloads
                 time.sleep(2)
             
-            return downloaded_files
+            return download_results
             
         except Exception as e:
             print(f"Error downloading all completed jobs: {e}")

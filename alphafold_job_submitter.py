@@ -88,12 +88,16 @@ class AlphaFoldJobSubmitter:
             entities_cleared = 0
             for button in entity_option_buttons:
                 try:
+                    # Scroll to the button first
+                    self.driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                    time.sleep(0.5)
+                    
                     # Click the options button to open menu
                     self.driver.execute_script("arguments[0].click();", button)
                     time.sleep(1)
                     
                     # Look for delete button in the dropdown menu
-                    delete_button = self.wait.until(
+                    delete_button = self.short_wait.until(
                         EC.element_to_be_clickable((
                             By.XPATH, 
                             "//button[contains(@class, 'mat-mdc-menu-item')]//span[text()='Delete']/.."
@@ -101,18 +105,24 @@ class AlphaFoldJobSubmitter:
                     )
                     
                     # Click delete
-                    delete_button.click()
+                    self.driver.execute_script("arguments[0].click();", delete_button)
                     time.sleep(1)
                     entities_cleared += 1
                     
                 except Exception as e:
                     print(f"Could not delete entity: {e}")
-                    # Click outside to close any open menus
-                    self.driver.find_element(By.TAG_NAME, "body").click()
+                    # Try to close any open menus by pressing ESC
+                    try:
+                        self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                        time.sleep(0.5)
+                    except:
+                        pass
                     continue
             
             if entities_cleared > 0:
                 print(f"Cleared {entities_cleared} existing entities")
+                # Wait a moment for the page to update after clearing entities
+                time.sleep(2)
             else:
                 print("No existing entities found")
             
@@ -204,9 +214,6 @@ class AlphaFoldJobSubmitter:
         try:
             print("Adding protein entity...")
             
-            # Dismiss any overlays first
-            self._dismiss_overlays()
-            
             # Find and click "Add entity" button
             add_entity_button = self._find_add_entity_button()
             if not add_entity_button:
@@ -226,9 +233,6 @@ class AlphaFoldJobSubmitter:
             
             print("Clicked Add entity button for protein")
             time.sleep(3)  # Wait for entity to be added
-            
-            # Dismiss any overlays that might appear after clicking
-            self._dismiss_overlays()
             
             # Wait for entity to be added and find the dropdown
             entity_dropdown = None
@@ -252,14 +256,7 @@ class AlphaFoldJobSubmitter:
                 raise Exception("Could not find entity type dropdown")
             
             # Click dropdown to open options
-            try:
-                entity_dropdown.click()
-            except Exception:
-                # If click is intercepted, dismiss overlays and try again
-                self._dismiss_overlays()
-                time.sleep(1)
-                self.driver.execute_script("arguments[0].click();", entity_dropdown)
-            
+            entity_dropdown.click()
             time.sleep(2)
             
             # Select "Protein" option
@@ -466,38 +463,13 @@ class AlphaFoldJobSubmitter:
             return False
     
     def _dismiss_overlays(self):
-        """Dismiss any overlays that might be blocking interactions"""
-        try:
-            # Look for overlay backdrops and dismiss them
-            overlay_selectors = [
-                "//div[contains(@class, 'cdk-overlay-backdrop')]",
-                "//div[contains(@class, 'mat-dialog-backdrop')]",
-                "//div[contains(@class, 'overlay-backdrop')]"
-            ]
-            
-            for selector in overlay_selectors:
-                overlays = self.driver.find_elements(By.XPATH, selector)
-                for overlay in overlays:
-                    try:
-                        if overlay.is_displayed():
-                            print("Found overlay backdrop, clicking to dismiss...")
-                            self.driver.execute_script("arguments[0].click();", overlay)
-                            time.sleep(1)
-                    except:
-                        pass
-                        
-            # Press ESC key to close any open dropdowns/dialogs
-            try:
-                self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(1)
-            except:
-                pass
-                
-        except Exception as e:
-            print(f"Error dismissing overlays: {e}")
+        """DISABLED: Do not dismiss any overlays to avoid interfering with dialogs"""
+        # This method is now disabled to prevent interference with job submission dialogs
+        print("Overlay dismissal disabled to preserve dialogs")
+        pass
 
     def _submit_job_with_name(self, job_name):
-        """Enter job name and submit the job
+        """FIXED: Enter job name and submit the job without any overlay dismissal
         
         Args:
             job_name (str): Name for the job
@@ -512,10 +484,9 @@ class AlphaFoldJobSubmitter:
             print("Waiting for job name dialog to appear...")
             time.sleep(5)
             
-            # Dismiss any overlays that might be blocking interaction
-            self._dismiss_overlays()
+            # DO NOT DISMISS ANY OVERLAYS - they might be the dialog we need!
             
-            # Find job name input using the EXACT XPath you provided
+            # Find job name input with increased timeout
             job_name_input = None
             input_selectors = [
                 "/html/body/div[3]/div[2]/div/mat-dialog-container/div/div/gdm-af-preview-dialog/main/form/mat-form-field/div[1]/div/div[2]/input",  # Your exact XPath
@@ -523,17 +494,24 @@ class AlphaFoldJobSubmitter:
                 "//gdm-af-preview-dialog//input[@matinput]",  # Input in preview dialog
                 "//input[@required and @matinput]",  # Required matinput field
                 "//form//input[@matinput]",  # Input in form
-                "//mat-form-field//input"  # Input in mat-form-field
+                "//mat-form-field//input",  # Input in mat-form-field
+                "//div[contains(@class, 'mat-dialog')]//input"  # Any input in dialog
             ]
+            
+            # Use a longer timeout to allow dialog to fully load
+            dialog_wait = WebDriverWait(self.driver, 20)
             
             for selector in input_selectors:
                 try:
                     print(f"Trying selector: {selector}")
-                    job_name_input = self.wait.until(
+                    
+                    job_name_input = dialog_wait.until(
                         EC.presence_of_element_located((By.XPATH, selector))
                     )
                     
-                    # Check if element is actually visible and interactable
+                    # Additional check - wait for it to be interactable
+                    dialog_wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
+                    
                     if job_name_input.is_displayed() and job_name_input.is_enabled():
                         print(f"Found job name input using: {selector}")
                         break
@@ -542,7 +520,7 @@ class AlphaFoldJobSubmitter:
                         job_name_input = None
                         
                 except TimeoutException:
-                    print(f"Could not find input with: {selector}")
+                    print(f"Timeout waiting for input with: {selector}")
                     continue
                 except Exception as e:
                     print(f"Error with selector {selector}: {e}")
@@ -553,93 +531,43 @@ class AlphaFoldJobSubmitter:
                 try:
                     self.driver.save_screenshot("job_name_input_not_found.png")
                     print("Screenshot saved: job_name_input_not_found.png")
+                    
+                    # Also save page source for debugging
+                    with open("page_source_debug.html", "w", encoding="utf-8") as f:
+                        f.write(self.driver.page_source)
+                    print("Page source saved: page_source_debug.html")
                 except:
                     pass
                 raise Exception("Could not find job name input field")
             
-            # Ensure the input field is visible and focused
-            print("Scrolling to job name input...")
-            self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", job_name_input)
-            time.sleep(2)
+            # Focus on the input field without clicking elsewhere
+            print("Focusing on job name input field...")
+            self.driver.execute_script("arguments[0].focus();", job_name_input)
+            time.sleep(0.5)
             
-            # Click to focus on the input field
-            print("Clicking on job name input field...")
-            try:
-                job_name_input.click()
-            except Exception as click_error:
-                print(f"Regular click failed: {click_error}, trying JavaScript click...")
-                self.driver.execute_script("arguments[0].click();", job_name_input)
-            
-            time.sleep(1)
-            
-            # Clear the field thoroughly using multiple methods
+            # Clear the field using JavaScript to avoid issues
             print("Clearing job name input field...")
+            self.driver.execute_script("arguments[0].value = '';", job_name_input)
+            time.sleep(0.3)
             
-            # Method 1: Select all and delete
-            try:
-                job_name_input.send_keys(Keys.CONTROL + "a")
-                time.sleep(0.5)
-                job_name_input.send_keys(Keys.DELETE)
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"Method 1 clearing failed: {e}")
-            
-            # Method 2: Check current value and clear with backspace
-            try:
-                current_value = job_name_input.get_attribute("value") or ""
-                if current_value:
-                    print(f"Current value before clearing: '{current_value}'")
-                    # Use backspace to clear character by character
-                    for _ in range(len(current_value)):
-                        job_name_input.send_keys(Keys.BACKSPACE)
-                        time.sleep(0.1)
-            except Exception as e:
-                print(f"Method 2 clearing failed: {e}")
-            
-            # Method 3: JavaScript clear
-            try:
-                self.driver.execute_script("arguments[0].value = '';", job_name_input)
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"Method 3 clearing failed: {e}")
-            
-            # Verify field is cleared
-            cleared_value = job_name_input.get_attribute("value") or ""
-            print(f"Value after clearing: '{cleared_value}'")
-            
-            # Enter the new job name
+            # Enter the job name using JavaScript to ensure it works
             print(f"Entering job name: '{job_name}'")
-            try:
-                job_name_input.send_keys(job_name)
-                time.sleep(1)
-            except Exception as e:
-                print(f"Failed to type job name: {e}")
-                # Try JavaScript method
-                self.driver.execute_script(f"arguments[0].value = '{job_name}';", job_name_input)
-                # Trigger input events
-                self.driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", job_name_input)
-                self.driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", job_name_input)
-                time.sleep(1)
+            self.driver.execute_script(f"arguments[0].value = '{job_name}';", job_name_input)
+            
+            # Trigger events to notify the form that the value changed
+            self.driver.execute_script("""
+                arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+                arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+                arguments[0].dispatchEvent(new Event('blur', { bubbles: true }));
+            """, job_name_input)
+            
+            time.sleep(0.5)
             
             # Verify the value was entered correctly
             entered_value = job_name_input.get_attribute("value") or ""
             print(f"Value after entering: '{entered_value}'")
             
-            if entered_value != job_name:
-                print(f"Warning: Entered value '{entered_value}' doesn't match expected '{job_name}'")
-                # Try one more time with JavaScript
-                self.driver.execute_script(f"arguments[0].value = '{job_name}';", job_name_input)
-                # Trigger change events
-                self.driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", job_name_input)
-                self.driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", job_name_input)
-                self.driver.execute_script("arguments[0].dispatchEvent(new Event('blur', { bubbles: true }));", job_name_input)
-                time.sleep(1)
-                
-                # Verify again
-                final_value = job_name_input.get_attribute("value") or ""
-                print(f"Final value after JavaScript: '{final_value}'")
-            
-            # Find submit button using multiple selectors
+            # Find submit button
             print("Looking for submit button...")
             submit_selectors = [
                 "//button[contains(text(), 'Confirm and submit job')]",
@@ -648,20 +576,21 @@ class AlphaFoldJobSubmitter:
                 "//mat-dialog-container//button[contains(text(), 'Confirm')]",
                 "//gdm-af-preview-dialog//button[contains(text(), 'Confirm')]",
                 "//button[contains(@class, 'mat-mdc-button') and contains(text(), 'submit')]",
-                "//form//button[contains(text(), 'submit')]"
+                "//form//button[contains(text(), 'submit')]",
+                "//div[contains(@class, 'mat-dialog')]//button[contains(text(), 'Confirm')]"
             ]
             
             submit_button = None
             for selector in submit_selectors:
                 try:
                     print(f"Trying submit button selector: {selector}")
-                    submit_button = self.wait.until(
+                    submit_button = dialog_wait.until(
                         EC.element_to_be_clickable((By.XPATH, selector))
                     )
                     print(f"Found submit button using: {selector}")
                     break
                 except TimeoutException:
-                    print(f"Could not find submit button with: {selector}")
+                    print(f"Timeout waiting for submit button with: {selector}")
                     continue
                 except Exception as e:
                     print(f"Error with submit selector {selector}: {e}")
@@ -676,18 +605,14 @@ class AlphaFoldJobSubmitter:
                     pass
                 raise Exception("Could not find Submit button")
             
-            # Scroll to submit button and click
-            print("Scrolling to submit button...")
-            self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", submit_button)
-            time.sleep(2)
-            
+            # Click submit button
             print("Clicking submit button...")
             try:
-                submit_button.click()
-            except Exception as click_error:
-                print(f"Regular click failed: {click_error}")
-                # Try JavaScript click if regular click fails
                 self.driver.execute_script("arguments[0].click();", submit_button)
+            except Exception as click_error:
+                print(f"JavaScript click failed: {click_error}")
+                # Try regular click as backup
+                submit_button.click()
             
             print("Clicked Confirm and submit job button")
             
@@ -709,6 +634,7 @@ class AlphaFoldJobSubmitter:
             import traceback
             traceback.print_exc()
             return None
+
     
     def _extract_job_id(self, job_name):
         """Try to extract job ID from page or URL

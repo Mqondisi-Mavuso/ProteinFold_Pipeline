@@ -1,6 +1,6 @@
 """
-AlphaFold Job Handler - FIXED VERSION
-Main orchestrator for AlphaFold job submission, monitoring, and downloading
+AlphaFold Job Handler - UPDATED VERSION WITH SCREENSHOT SUPPORT
+Main orchestrator for AlphaFold job submission, monitoring, and downloading with screenshot capture
 """
 import os
 import time
@@ -15,12 +15,12 @@ from alphafold_browser_manager import AlphaFoldBrowserManager
 
 
 class AlphaFoldJobHandler(QThread):
-    """Main handler for AlphaFold job processing"""
+    """Main handler for AlphaFold job processing with screenshot support"""
     
     # Signals for GUI updates
     progress_update = pyqtSignal(str)  # status message
     job_started = pyqtSignal(str, str)  # job_name, job_id
-    job_completed = pyqtSignal(str, str, str)  # job_name, job_id, download_path
+    job_completed = pyqtSignal(str, str, str, str)  # job_name, job_id, download_path, screenshot_path
     job_failed = pyqtSignal(str, str)  # job_name, error_message
     batch_completed = pyqtSignal(dict)  # summary statistics
     job_progress = pyqtSignal(int, int, str)  # current_job, total_jobs, current_status
@@ -187,7 +187,7 @@ class AlphaFoldJobHandler(QThread):
             self._cleanup()
     
     def _process_single_job(self, job):
-        """Process a single job from submission to download
+        """Process a single job from submission to download with screenshot
         
         Args:
             job: Job dictionary with sequences and metadata
@@ -229,13 +229,27 @@ class AlphaFoldJobHandler(QThread):
                 self.progress_update.emit(f"Job {job_name} did not complete successfully: {final_status}")
                 return False
             
-            # Step 3: Download results
-            self.progress_update.emit(f"Downloading results for: {job_name}")
-            download_path = self.job_downloader.download_job_results(job_name)
+            # Step 3: Download results and take screenshot
+            self.progress_update.emit(f"Downloading results and taking screenshot for: {job_name}")
+            download_result = self.job_downloader.download_job_results(
+                job_name, 
+                max_wait_minutes=5, 
+                take_screenshot=True
+            )
             
-            if download_path:
-                self.job_completed.emit(job_name, job_id, download_path)
+            if download_result and download_result['downloaded_file']:
+                download_path = download_result['downloaded_file']
+                screenshot_path = download_result.get('screenshot_path', 'No screenshot')
+                
+                self.job_completed.emit(job_name, job_id, download_path, screenshot_path)
+                
+                # Log both download and screenshot
                 self.progress_update.emit(f"Results downloaded to: {download_path}")
+                if screenshot_path and screenshot_path != 'No screenshot':
+                    self.progress_update.emit(f"Screenshot saved to: {screenshot_path}")
+                else:
+                    self.progress_update.emit(f"Warning: Screenshot could not be taken for {job_name}")
+                
                 return True
             else:
                 self.progress_update.emit(f"Failed to download results for: {job_name}")
@@ -255,7 +269,15 @@ class AlphaFoldJobHandler(QThread):
         self.processing_log.append(log_entry)
     
     def _generate_batch_summary(self):
-        """Generate and save batch processing summary"""
+        """Generate and save batch processing summary with screenshot info"""
+        # Enhance successful jobs info with screenshot status
+        enhanced_successful_jobs = []
+        for job in self.successful_jobs:
+            job_copy = job.copy()
+            # Add screenshot info if available
+            job_copy['has_screenshot'] = False  # This would be set during processing
+            enhanced_successful_jobs.append(job_copy)
+        
         summary = {
             'batch_info': {
                 'start_time': self.processing_log[0]['timestamp'] if self.processing_log else None,
@@ -263,11 +285,12 @@ class AlphaFoldJobHandler(QThread):
                 'total_jobs': len(self.jobs_to_process),
                 'successful_jobs': len(self.successful_jobs),
                 'failed_jobs': len(self.failed_jobs),
-                'success_rate': len(self.successful_jobs) / len(self.jobs_to_process) * 100 if self.jobs_to_process else 0
+                'success_rate': len(self.successful_jobs) / len(self.jobs_to_process) * 100 if self.jobs_to_process else 0,
+                'screenshots_taken': sum(1 for job in enhanced_successful_jobs if job.get('has_screenshot', False))
             },
             'download_config': self.download_config,
             'results_directory': self.results_dir,
-            'successful_jobs': self.successful_jobs,
+            'successful_jobs': enhanced_successful_jobs,
             'failed_jobs': self.failed_jobs,
             'processing_log': self.processing_log
         }

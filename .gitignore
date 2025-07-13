@@ -13,3 +13,4 @@ alphafold_cookies.pkl
 alphafold_batch_results/
 test_chrome.py
 automation_screenshots/
+alphafold_cookies.pkl

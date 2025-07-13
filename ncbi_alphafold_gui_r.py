@@ -1578,6 +1578,19 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.login_status_label)
         status_layout.addStretch()
         login_layout.addLayout(status_layout)
+
+        # 6. ADDED configuration option for screenshots
+        screenshot_layout = QHBoxLayout()
+        self.capture_screenshots = QCheckBox("Capture screenshots of results pages")
+        self.capture_screenshots.setChecked(True)  # Default to enabled
+        self.capture_screenshots.setToolTip("Automatically take screenshots of AlphaFold results pages")
+        screenshot_layout.addWidget(self.capture_screenshots)
+        screenshot_layout.addStretch()
+
+        # Add info about screenshots
+        screenshot_info = QLabel("Screenshots will be saved with the same name as the job in the download directory")
+        screenshot_info.setStyleSheet("color: #666; font-size: 10px;")
+        screenshot_info.setWordWrap(True)
         
         # Login buttons
         login_buttons_layout = QHBoxLayout()
@@ -2157,9 +2170,6 @@ class MainWindow(QMainWindow):
             self.batch_log.append(f"Job timeout: {download_config['job_timeout_minutes']} minutes")
             self.batch_log.append("="*50)
             
-            # Create and start the AlphaFold job handler
-            from alphafold_job_handler import AlphaFoldJobHandler
-            
             self.batch_handler = AlphaFoldJobHandler(
                 login_handler=self.alphafold_login_handler,
                 download_config=download_config
@@ -2168,20 +2178,51 @@ class MainWindow(QMainWindow):
             # Connect signals for real-time updates
             self.batch_handler.progress_update.connect(self.on_automation_progress)
             self.batch_handler.job_started.connect(self.on_automation_job_started)
-            self.batch_handler.job_completed.connect(self.on_automation_job_completed)
+            self.batch_handler.job_completed.connect(self.on_automation_job_completed_with_screenshot)
             self.batch_handler.job_failed.connect(self.on_automation_job_failed)
             self.batch_handler.batch_completed.connect(self.on_automation_batch_completed)
             self.batch_handler.job_progress.connect(self.on_automation_job_progress)
-            
+
+            # Add info about screenshots
+            screenshot_info = QLabel("Screenshots will be saved with the same name as the job in the download directory")
+            screenshot_info.setStyleSheet("color: #666; font-size: 10px;")
+            screenshot_info.setWordWrap(True)
+                        
             # Set jobs and start processing
             self.batch_handler.set_jobs(self.batch_jobs)
             self.batch_handler.start()
             
             self.batch_log.append("✓ AlphaFold automation started successfully")
+            self.batch_log.append("📸 Screenshots will be captured for each completed job")
             
         except Exception as e:
             self._handle_batch_error(f"Error starting batch submission: {str(e)}")
 
+    # 2. ADD new signal handler method for job completion with screenshot
+    def on_automation_job_completed_with_screenshot(self, job_name, job_id, download_path, screenshot_path):
+        """Handle job completed signal with screenshot information"""
+        self.current_job_index += 1
+        self.jobs_completed_label.setText(f"Jobs completed: {self.current_job_index}")
+        
+        # Store successful job info with screenshot
+        job_info = {
+            'name': job_name,
+            'id': job_id,
+            'download_path': download_path,
+            'screenshot_path': screenshot_path,
+            'completed_time': datetime.now().isoformat()
+        }
+        self.successful_jobs.append(job_info)
+        
+        # Log completion with screenshot info
+        self.batch_log.append(f"Completed: {job_name}")
+        self.batch_log.append(f"   Downloaded: {download_path}")
+        
+        if screenshot_path and screenshot_path != 'No screenshot':
+            self.batch_log.append(f"   Screenshot: {screenshot_path}")
+        else:
+            self.batch_log.append(f"   Screenshot could not be taken")
+    
     def prepare_batch_jobs(self):
         """Prepare the list of jobs for batch submission (Updated)"""
         self.batch_jobs = []
@@ -2310,11 +2351,12 @@ class MainWindow(QMainWindow):
             'failed_time': datetime.now().isoformat()
         })
         
-        self.batch_log.append(f"❌ Failed: {job_name}")
+        self.batch_log.append(f"  Failed: {job_name}")
         self.batch_log.append(f"   Error: {error_message}")
 
+    # 3. UPDATED the batch completion handler to include screenshot info
     def on_automation_batch_completed(self, summary):
-        """Handle batch completion signal"""
+        """Handle batch completion signal with enhanced screenshot reporting"""
         # Reset UI state
         self._set_batch_ui_state(processing=False)
         
@@ -2322,28 +2364,45 @@ class MainWindow(QMainWindow):
         self.batch_status_label.setText("Batch completed!")
         self.current_job_label.setText("All jobs processed")
         
-        # Log final summary
+        # Calculate screenshot statistics
+        total_screenshots = 0
+        failed_screenshots = 0
+        
+        for job in self.successful_jobs:
+            if job.get('screenshot_path'):
+                if job['screenshot_path'] != 'No screenshot':
+                    total_screenshots += 1
+                else:
+                    failed_screenshots += 1
+            else:
+                failed_screenshots += 1
+        
+        # Log final summary with screenshot info
         successful = summary.get('successful_jobs', 0)
         failed = summary.get('failed_jobs', 0)
         total = summary.get('total_jobs', 0)
         success_rate = summary.get('success_rate', 0)
         
         self.batch_log.append("="*50)
-        self.batch_log.append("🎉 BATCH COMPLETED!")
+        self.batch_log.append("BATCH COMPLETED!")
         self.batch_log.append(f"Total jobs: {total}")
         self.batch_log.append(f"Successful: {successful}")
         self.batch_log.append(f"Failed: {failed}")
         self.batch_log.append(f"Success rate: {success_rate:.1f}%")
+        self.batch_log.append(f"Screenshots taken: {total_screenshots}")
+        if failed_screenshots > 0:
+            self.batch_log.append(f"Screenshots failed: {failed_screenshots}")
         self.batch_log.append("="*50)
         
-        # Show completion dialog
+        # Show completion dialog with screenshot info
         completion_message = (
             f"Batch processing completed!\n\n"
             f"Protein: {self.selected_protein['name']}\n"
             f"Total jobs: {total}\n"
             f"Successful: {successful}\n"
             f"Failed: {failed}\n"
-            f"Success rate: {success_rate:.1f}%\n\n"
+            f"Success rate: {success_rate:.1f}%\n"
+            f"Screenshots captured: {total_screenshots}/{successful}\n\n"
             f"Results saved to: {self.download_directory}\n\n"
             f"Check the batch log for detailed information."
         )
@@ -2365,6 +2424,36 @@ class MainWindow(QMainWindow):
                     subprocess.Popen(["xdg-open", self.download_directory])
             except Exception as e:
                 self.batch_log.append(f"Could not open downloads folder: {str(e)}")
+
+    # 4. ADDED method to view screenshots (optional enhancement)
+    def view_job_screenshot(self, job_info):
+        """Open screenshot for a specific job (if available)"""
+        try:
+            screenshot_path = job_info.get('screenshot_path')
+            
+            if not screenshot_path or screenshot_path == 'No screenshot':
+                QMessageBox.warning(self, "No Screenshot", 
+                                f"No screenshot available for job: {job_info['name']}")
+                return
+            
+            if not os.path.exists(screenshot_path):
+                QMessageBox.warning(self, "Screenshot Not Found", 
+                                f"Screenshot file not found: {screenshot_path}")
+                return
+            
+            # Try to open screenshot with default image viewer
+            
+            if platform.system() == "Windows":
+                subprocess.Popen(f'start "" "{screenshot_path}"', shell=True)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.Popen(["open", screenshot_path])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", screenshot_path])
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", 
+                            f"Could not open screenshot: {str(e)}")
+
 
     def on_automation_job_progress(self, current_job, total_jobs, current_status):
         """Handle job progress updates"""
@@ -2913,12 +3002,19 @@ class MainWindow(QMainWindow):
         return True, "Download configuration is valid"
 
     def get_download_configuration(self):
-        """Get the current download configuration"""
+        """Get the current download configuration (UPDATED with screenshot setting)"""
+        
+        # Check if capture_screenshots checkbox exists and get its value
+        capture_screenshots = False
+        if hasattr(self, 'capture_screenshots') and self.capture_screenshots is not None:
+            capture_screenshots = self.capture_screenshots.isChecked()
+        
         return {
             'download_directory': self.download_directory,
             'job_timeout_minutes': self.job_timeout_input.value(),
             'status_check_interval_minutes': self.status_check_interval.value(),
-            'auto_open_downloads': self.auto_open_downloads.isChecked()
+            'auto_open_downloads': self.auto_open_downloads.isChecked(),
+            'capture_screenshots': capture_screenshots  # Safe way to get the value
         }
 
     # Update your existing update_batch_submit_button method to include download check
