@@ -78,7 +78,17 @@ class AlphaFoldJobDownloader:
             # Take screenshot of results page if requested
             screenshot_path = None
             if take_screenshot:
-                screenshot_path = self._take_results_screenshot(job_name, job_row)
+                # Find the job row again (it might have changed after download)
+                job_row = self._find_job_row(job_name)
+                if job_row:
+                    screenshot_path = self._take_results_screenshot(job_name, job_row)
+                else:
+                    print("Could not find job row again for screenshot")
+            else:
+                # If not taking screenshot, we still need to navigate back to homepage
+                # for the next job in the batch
+                print("Screenshots disabled - navigating back to homepage for next job")
+                self._navigate_back_to_homepage()
             
             return {
                 'downloaded_file': downloaded_file,
@@ -88,6 +98,11 @@ class AlphaFoldJobDownloader:
                 
         except Exception as e:
             print(f"Error downloading job results: {e}")
+            # Try to navigate back to homepage to not break the batch
+            try:
+                self._navigate_back_to_homepage()
+            except:
+                pass
             return None
     
     def _take_results_screenshot(self, job_name, job_row):
@@ -131,10 +146,21 @@ class AlphaFoldJobDownloader:
             self.driver.save_screenshot(screenshot_path)
             
             print(f"Screenshot saved: {screenshot_path}")
+            
+            # CRITICAL: Navigate back to AlphaFold homepage for next job
+            if not self._navigate_back_to_homepage():
+                print("Warning: Failed to navigate back to homepage")
+                # Still return the screenshot path since we got it successfully
+            
             return screenshot_path
             
         except Exception as e:
             print(f"Error taking results screenshot: {e}")
+            # Try to navigate back to homepage even if screenshot failed
+            try:
+                self._navigate_back_to_homepage()
+            except:
+                pass
             return None
     
     def _click_open_results_option(self):
@@ -190,6 +216,68 @@ class AlphaFoldJobDownloader:
             
         except Exception as e:
             print(f"Error clicking 'Open results' option: {e}")
+            return False
+    
+    def _navigate_back_to_homepage(self):
+        """Navigate back to AlphaFold homepage to see the jobs table
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            print("Navigating back to AlphaFold homepage...")
+            
+            # Method 1: Try to go to the main AlphaFold server page
+            self.driver.get("https://alphafoldserver.com/")
+            time.sleep(3)
+            
+            # Wait for the jobs table to appear (this confirms we're back to the right page)
+            try:
+                self.wait.until(
+                    EC.presence_of_element_located((By.XPATH, "//table[@mat-table]"))
+                )
+                print("✓ Successfully navigated back to homepage with jobs table")
+                return True
+            except TimeoutException:
+                print("Jobs table not found, trying alternative navigation...")
+                
+                # Method 2: Look for and click navigation elements
+                nav_elements = [
+                    "//a[contains(text(), 'Jobs')]",
+                    "//a[contains(text(), 'My jobs')]",
+                    "//button[contains(text(), 'Jobs')]",
+                    "//nav//a[contains(@href, 'jobs')]",
+                    "//a[@routerlink='/jobs']"
+                ]
+                
+                for nav_xpath in nav_elements:
+                    try:
+                        nav_element = self.driver.find_element(By.XPATH, nav_xpath)
+                        self.driver.execute_script("arguments[0].click();", nav_element)
+                        time.sleep(2)
+                        
+                        # Check if jobs table appeared
+                        if self.driver.find_elements(By.XPATH, "//table[@mat-table]"):
+                            print(f"✓ Successfully navigated using: {nav_xpath}")
+                            return True
+                    except:
+                        continue
+                
+                # Method 3: Use browser back button as fallback
+                print("Trying browser back button...")
+                self.driver.back()
+                time.sleep(2)
+                
+                # Check if we're back to jobs table
+                if self.driver.find_elements(By.XPATH, "//table[@mat-table]"):
+                    print("✓ Successfully navigated back using browser back button")
+                    return True
+                
+                print("⚠️ Could not navigate back to jobs table")
+                return False
+                
+        except Exception as e:
+            print(f"Error navigating back to homepage: {e}")
             return False
     
     def _clean_filename(self, filename):
